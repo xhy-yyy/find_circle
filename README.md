@@ -2,6 +2,8 @@
 
 无人机下视相机找地面的白色石灰圆环（直径约 2 m），输出圆心像素坐标、半径和状态。不用神经网络，不需要训练数据。
 
+**上手：** 所有操作都用 `./run.sh`（`./run.sh help` 列出命令），步骤见 [docs/使用教程.md](docs/使用教程.md)。
+
 ## 使用流程
 
 1. 100 m 高空往往看不清环。操作员在画面上粗点一下环的大致位置。
@@ -93,7 +95,7 @@ python3 tools/run_camera.py --dev /dev/video0 --size 1920x1080 --calib cam.yaml 
 | `click_px`、`click_bearing` | 点击点在当前帧的位置和方向（光流搬运）；首锁后、未点击时为 `null` |
 | `motion_ok` | 本帧地面光流是否有效 |
 
-相机断流时每 200 ms 发一次 `LOST` 心跳（`phase` 为 `NO_FRAME`，字段和正常消息相同、值为空）。完整接口约定见 [docs/白色石灰圆环识别_技术方案.docx](docs/白色石灰圆环识别_技术方案.docx) 第七节。
+相机断流时每 200 ms 发一次 `LOST` 心跳（`phase` 为 `NO_FRAME`，字段和正常消息相同、值为空）。完整接口约定见 [docs/白色石灰圆环识别_技术方案.docx](docs/白色石灰圆环识别_技术方案.docx) 第四节。
 
 相机标定用 ROS `camera_calibration` 的 yaml 格式（`--calib`）。没标定时按 90° 水平视场估算，`bearing` 只是近似值。
 

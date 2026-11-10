@@ -4,9 +4,9 @@
 用法：
   python3 tools/run_camera.py [--dev /dev/video0] [--size 1920x1080] [--fps 30]
       [--calib cam.yaml] [--udp 192.168.1.10:9000] [--listen 9001]
-      [--record raw.avi] [--show] [--quiet]
+      [--record raw.avi] [--log out.jsonl] [--show] [--quiet]
 
-输出：每帧一条 JSON（字段见 README"输出"），--udp 发到指定地址，否则打印到 stdout。
+输出：每帧一条 JSON（字段见 README"输出"），--udp 发到指定地址，否则打印到 stdout；--log 同时写入文件。
 输入：--listen 端口收 JSON：
   {"click": [x, y]}           原图像素
   {"click_norm": [u, v]}      归一化 0~1（G30 画面点击，已去掉显示黑边）
@@ -68,6 +68,7 @@ def main():
     ap.add_argument('--udp')
     ap.add_argument('--listen', type=int)
     ap.add_argument('--record')
+    ap.add_argument('--log', help='每帧结果同时写入这个 JSONL 文件')
     ap.add_argument('--show', action='store_true')
     ap.add_argument('--quiet', action='store_true')
     ap.add_argument('--stale-ms', type=float, default=200, help='超过这么久没有新帧就发 LOST 心跳')
@@ -106,8 +107,12 @@ def main():
         in_sock.bind(('0.0.0.0', a.listen))
         in_sock.setblocking(False)
 
+    log_f = open(a.log, 'a', encoding='utf-8', buffering=1) if a.log else None
+
     def emit(d):
         s = json.dumps(d, ensure_ascii=False)
+        if log_f:
+            log_f.write(s + '\n')
         if out_sock:
             out_sock.sendto(s.encode(), out_addr)
         elif not a.quiet:
@@ -189,6 +194,8 @@ def main():
         cap.release()
         if writer is not None:
             writer.release()
+        if log_f:
+            log_f.close()
 
 
 if __name__ == '__main__':
