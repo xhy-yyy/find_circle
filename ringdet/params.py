@@ -125,7 +125,7 @@ class TrackParams:
     cand_timeout_s: float = 1.0  # 候选这么久没通过就丢弃
     coast_s: float = 0.3
     reacq_box_r: float = 6.0     # 重捕框边长 = 6r
-    reacq_box_min: float = 160.0  # 小环重捕框的最小边长（原图 px）
+    reacq_box_min: float = 240.0  # 小环重捕框的最小边长（原图 px）
     reacq_radius: float = 0.25   # 重捕半径范围 ±25%
     reacq_expand_s: float = 1.0  # 之后扩到全图、半径 ±50%
     reacq_giveup_s: float = 3.0  # 之后回到 SEARCH
@@ -136,6 +136,11 @@ class TrackParams:
     # 防止近地出画后锁到地上一圈碎石之类的小圆。有高度时与高度给出的范围取交集；reset() 或点击会清掉。
     lost_r_floor: float = 0.5
     template_score: float = 0.65  # 局部外观匹配通过后仍需几何复核
+    identity_score: float = 0.8   # 重捕身份分；较弱结果还须严格几何与更长确认
+    identity_margin: float = 0.06  # 两个重捕候选的身份分太接近时暂不接回
+    reacq_confirm_hits: int = 3
+    reacq_weak_hits: int = 5
+    template_update_hits: int = 8  # 重捕后通过稳定测量才更新身份参考
 
 
 @dataclass

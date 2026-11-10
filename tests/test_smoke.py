@@ -146,3 +146,126 @@ def test_template_recovers_jump_when_optical_flow_fails(monkeypatch, dx, dy):
     assert result.state == 'DETECTED'
     assert result.target_id == target_id
     assert math.dist(result.center_px, (320 + dx, 180 + dy)) < 1.5
+
+
+def test_foreign_circle_cannot_replace_trusted_identity(monkeypatch):
+    rng = np.random.default_rng(35)
+    background = synth.ground_texture(360, 640, rng)
+    image = background.copy()
+    synth.draw_ring(image, 320, 180, 18, 2, 75)
+    image = synth.degrade(image, rng)
+    tracker = RingTracker(Params(), Camera.default(640, 360))
+    tracker.set_click(320, 180)
+    for i in range(12):
+        result = tracker.process(image, i / 30, i)
+    assert result.state == 'DETECTED' and tracker.references
+    original = tracker.references[0]['image'].copy()
+    adaptive = tracker.template['image'].copy()
+    reference_count = len(tracker.references)
+    monkeypatch.setattr(tracker.motion, 'update', lambda _: None)
+    tracker.process(np.zeros((360, 640), dtype=np.uint8), 11.5 / 30, 12)
+    assert tracker.phase == 'REACQUIRE'
+    foreign = synth.ground_texture(360, 640, np.random.default_rng(36))
+    synth.draw_ring(foreign, 320, 180, 18, 2, 75)
+    foreign = synth.degrade(foreign, rng)
+    for i in range(12, 32):
+        result = tracker.process(foreign, i / 30, i)
+        assert result.state != 'DETECTED'
+        np.testing.assert_array_equal(tracker.references[0]['image'], original)
+        np.testing.assert_array_equal(tracker.template['image'], adaptive)
+        assert len(tracker.references) == reference_count
+    for i in range(32, 34):
+        result = tracker.process(image, i / 30, i)
+        assert result.state != 'DETECTED'
+    result = tracker.process(image, 34 / 30, 34)
+    assert result.state == 'DETECTED' and result.target_id == 1
+    assert tracker.template_hold > 0
+    np.testing.assert_array_equal(tracker.references[0]['image'], original)
+    assert len(tracker.references) == reference_count
+
+
+def test_identity_probation_keeps_valid_continuous_tracking(monkeypatch):
+    rng = np.random.default_rng(41)
+    image = synth.ground_texture(360, 640, rng)
+    synth.draw_ring(image, 320, 180, 18, 2, 75)
+    image = synth.degrade(image, rng)
+    tracker = RingTracker(Params(), Camera.default(640, 360))
+    tracker.set_click(320, 180)
+    for i in range(12):
+        result = tracker.process(image, i / 30, i)
+    assert result.state == 'DETECTED'
+    references = [ref['image'].copy() for ref in tracker.references]
+    tracker.template_hold = tracker.P.track.template_update_hits
+    monkeypatch.setattr(tracker, '_recovery_identity', lambda *_: False)
+    for i in range(12, 24):
+        result = tracker.process(image, i / 30, i)
+        assert result.state == 'DETECTED' and result.phase == 'TRACK'
+        assert math.dist(result.center_px, (320, 180)) < 1.5
+    assert tracker.template_hold == tracker.P.track.template_update_hits
+    assert len(tracker.references) == len(references)
+    for ref, original in zip(tracker.references, references):
+        np.testing.assert_array_equal(ref['image'], original)
+
+
+def test_pending_recovery_cannot_bypass_confirmation(monkeypatch):
+    rng = np.random.default_rng(42)
+    image = synth.ground_texture(360, 640, rng)
+    synth.draw_ring(image, 320, 180, 18, 2, 75)
+    image = synth.degrade(image, rng)
+    tracker = RingTracker(Params(), Camera.default(640, 360))
+    tracker.set_click(320, 180)
+    for i in range(12):
+        result = tracker.process(image, i / 30, i)
+    assert result.state == 'DETECTED'
+    monkeypatch.setattr(tracker.motion, 'update', lambda _: None)
+    shifted = cv2.warpAffine(image, np.float32([[1, 0, 70], [0, 1, 0]]), (640, 360))
+    for i in range(12, 14):
+        result = tracker.process(shifted, i / 30, i)
+        assert result.state == 'LOST' and result.phase == 'REACQUIRE'
+    result = tracker.process(shifted, 14 / 30, 14)
+    assert result.state == 'DETECTED' and result.target_id == 1
+    assert math.dist(result.center_px, (390, 180)) < 1.5
+
+
+def test_equal_identity_candidates_remain_ambiguous(monkeypatch):
+    rng = np.random.default_rng(37)
+    background = synth.ground_texture(360, 640, rng)
+    image = background.copy()
+    synth.draw_ring(image, 320, 180, 18, 2, 75)
+    image = synth.degrade(image, rng)
+    params = Params()
+    params.track.reacq_box_min = 300
+    tracker = RingTracker(params, Camera.default(640, 360))
+    tracker.set_click(320, 180)
+    for i in range(12):
+        result = tracker.process(image, i / 30, i)
+    assert result.state == 'DETECTED' and tracker.references
+    monkeypatch.setattr(tracker.motion, 'update', lambda _: None)
+    tracker.process(np.zeros((360, 640), dtype=np.uint8), 11.5 / 30, 12)
+    assert tracker.phase == 'REACQUIRE'
+    reference = tracker.references[0]['image'].copy()
+    ambiguous = np.clip(background, 0, 255).astype(np.uint8)
+    n = reference.shape[0]
+    for x in (265, 375):
+        x0, y0 = x - n // 2, 180 - n // 2
+        ambiguous[y0:y0+n, x0:x0+n] = reference
+    result = tracker.process(ambiguous, 12 / 30, 12)
+    assert result.state == 'LOST' and result.ambiguous
+    np.testing.assert_array_equal(tracker.references[0]['image'], reference)
+
+
+def test_click_can_replace_identity_even_near_current_target():
+    rng = np.random.default_rng(38)
+    image = synth.ground_texture(360, 640, rng)
+    synth.draw_ring(image, 320, 180, 18, 2, 75)
+    image = synth.degrade(image, rng)
+    tracker = RingTracker(Params(), Camera.default(640, 360))
+    tracker.set_click(320, 180)
+    for i in range(12):
+        result = tracker.process(image, i / 30, i)
+    assert result.state == 'DETECTED' and tracker.references
+    tracker.tgt = [350, 180, 18]
+    tracker.set_click(320, 180)
+    result = tracker.process(image, 12 / 30, 12)
+    assert result.click_px is not None
+    assert not tracker.references
