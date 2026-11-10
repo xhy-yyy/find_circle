@@ -26,7 +26,7 @@ class SearchParams:
     level_r_max: float = 20.0    # 层内半径超过它就去下一层金字塔
     tile: int = 512              # 分块边长（层内 px），块间重叠 = 最大核半径
     radii_per_job: int = 6       # 每个任务 = 一块 x 至多这么多个半径
-    budget_ms: float = 40.0      # 跟踪器每帧搜索的时间预算（至少做 1 个任务）
+    budget_ms: float = 40.0      # 搜索候选生成与复核共用的每帧预算
     min_score: float = 2.0       # S = min(M-I, M-O) / max(sigma, noise_floor)
     side_ratio: float = 3.0      # |I-O| > side_ratio*S 的位置不当候选
     noise_floor: float = 2.0
@@ -125,6 +125,7 @@ class TrackParams:
     cand_timeout_s: float = 1.0  # 候选这么久没通过就丢弃
     coast_s: float = 0.3
     reacq_box_r: float = 6.0     # 重捕框边长 = 6r
+    reacq_box_min: float = 160.0  # 小环重捕框的最小边长（原图 px）
     reacq_radius: float = 0.25   # 重捕半径范围 ±25%
     reacq_expand_s: float = 1.0  # 之后扩到全图、半径 ±50%
     reacq_giveup_s: float = 3.0  # 之后回到 SEARCH
@@ -134,6 +135,7 @@ class TrackParams:
     # 下降中途丢失后回到全图搜索时，半径下限 = 最后跟踪半径 x 它（飞机只降不升，环不会变小太多）；
     # 防止近地出画后锁到地上一圈碎石之类的小圆。有高度时与高度给出的范围取交集；reset() 或点击会清掉。
     lost_r_floor: float = 0.5
+    template_score: float = 0.65  # 局部外观匹配通过后仍需几何复核
 
 
 @dataclass

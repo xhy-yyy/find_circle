@@ -13,6 +13,7 @@ import collections
 import json
 import os
 import sys
+import time
 
 import numpy as np
 import cv2
@@ -73,6 +74,7 @@ def main():
     i = 0
     paused = False
     frame = None
+    next_display = time.perf_counter()
     while True:
         if not paused or frame is None:
             ok, frame = cap.read()
@@ -99,11 +101,18 @@ def main():
                 break
         if a.show:
             cv2.imshow('ringdet', cv2.resize(vis, None, fx=disp_scale, fy=disp_scale) if disp_scale < 1 else vis)
-            k = cv2.waitKey(0 if paused else 1) & 0xFF
+            if paused:
+                delay = 0
+            else:
+                now = time.perf_counter()
+                next_display = max(next_display + 1 / fps, now)
+                delay = max(1, int(round((next_display - now) * 1000)))
+            k = cv2.waitKey(delay) & 0xFF
             if k == ord('q'):
                 break
             if k == ord(' '):
                 paused = not paused
+                next_display = time.perf_counter()
             if k == ord('r'):
                 trk.reset()
     writer.release()

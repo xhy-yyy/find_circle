@@ -4,6 +4,7 @@ import os
 import sys
 
 import numpy as np
+import cv2
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
@@ -83,3 +84,65 @@ def test_ring_appears_only_after_descent():
         if i < 51:
             assert res.state == 'LOST'
     assert 'DETECTED' in states[51:], states[51:]
+
+
+def test_target_motion_ignores_different_foreground_motion():
+    from ringdet.motion import GroundMotion
+    rng = np.random.default_rng(21)
+    far = np.clip(synth.ground_texture(360, 640, rng, amp=18), 0, 255).astype(np.uint8)
+    near = np.clip(synth.ground_texture(360, 640, rng, amp=55), 0, 255).astype(np.uint8)
+    first = far.copy()
+    first[:, :360] = near[:, :360]
+    second = cv2.warpAffine(far, np.float32([[1, 0, 4], [0, 1, -2]]), (640, 360))
+    foreground = cv2.warpAffine(near, np.float32([[1, 0, -12], [0, 1, 7]]), (640, 360))
+    second[:, :360] = foreground[:, :360]
+    motion = GroundMotion(Params().motion)
+    motion.focus = (510, 180, 12)
+    motion.update(first)
+    transform = motion.update(second)
+    assert transform is not None
+    assert math.dist(transform.apply(510, 180), (514, 178)) < 1
+
+
+def test_reacquire_same_ring_after_occlusion_with_decoy():
+    hidden = set(range(15, 36))
+    frames, gts = synth.descent(np.random.default_rng(17), n=55, size=(640, 360),
+                               r0=12, r1=16, contrast=65, drift=(1.2, 0.2),
+                               jitter=1.2, rot_deg=0.8, hide=hidden, distractors=False)
+    tracker = RingTracker(Params(), Camera.default(640, 360))
+    tracker.set_click(gts[0][0], gts[0][1])
+    results = []
+    for i, (frame, gt) in enumerate(zip(frames, gts)):
+        if i in hidden:
+            frame = frame.astype(np.float32)
+            synth.draw_ring(frame, gt[0] + 65, gt[1], gt[2], 1.5, 65)
+            frame = np.clip(frame, 0, 255).astype(np.uint8)
+        result = tracker.process(frame, i / 30, i)
+        results.append(result)
+        if i in hidden:
+            assert result.state != 'DETECTED', f'遮挡时误锁：frame={i}, {result.center_px}'
+        elif result.state == 'DETECTED':
+            assert math.dist(result.center_px, gt[:2]) < 2
+    assert any(r.state == 'LOST' for r in results[15:36])
+    assert any(r.state == 'DETECTED' for r in results[36:40])
+    assert {r.target_id for r in results if r.state == 'DETECTED'} == {1}
+
+
+@pytest.mark.parametrize('dx,dy', [(6, -2), (18, -12)])
+def test_template_recovers_jump_when_optical_flow_fails(monkeypatch, dx, dy):
+    rng = np.random.default_rng(24)
+    image = synth.ground_texture(360, 640, rng)
+    synth.draw_ring(image, 320, 180, 14, 1.5, 70)
+    image = synth.degrade(image, rng)
+    tracker = RingTracker(Params(), Camera.default(640, 360))
+    tracker.set_click(320, 180)
+    for i in range(10):
+        result = tracker.process(image, i / 30, i)
+    assert result.state == 'DETECTED'
+    target_id = result.target_id
+    monkeypatch.setattr(tracker.motion, 'update', lambda _: None)
+    shifted = cv2.warpAffine(image, np.float32([[1, 0, dx], [0, 1, dy]]), (640, 360))
+    result = tracker.process(shifted, 10 / 30, 10)
+    assert result.state == 'DETECTED'
+    assert result.target_id == target_id
+    assert math.dist(result.center_px, (320 + dx, 180 + dy)) < 1.5
