@@ -8,7 +8,7 @@ DEV="${DEV:-/dev/video0}"              # 相机设备
 SIZE="${SIZE:-1920x1080}"              # 分辨率
 FPS="${FPS:-30}"
 CALIB="${CALIB:-}"                     # 相机标定 yaml（ROS camera_info 格式）；空 = 未标定
-EXPOSURE="${EXPOSURE:-20}"             # 曝光，单位 100 us（20 = 2 ms）；auto = 不改相机曝光
+EXPOSURE="${EXPOSURE:-keep}"           # keep = 保持相机控制项；auto = 自动曝光；数字单位 100 us
 UDP_OUT="${UDP_OUT:-}"                 # 结果发到哪里，如 192.168.1.10:9000；空 = 打印到屏幕
 LISTEN="${LISTEN:-9001}"               # 接收点击/高度/重置的端口
 REC_DIR="${REC_DIR:-$HOME/find_circle_rec}"   # 机载运行时录像和结果日志的目录；空 = 不录
@@ -48,6 +48,7 @@ cmd_help() {
   height <米|null>              发离地高度
   reset                        清除点击和目标
   listen [端口]                 接收并显示视觉的输出（默认 9000），用来联调
+  clean [--dry-run]             清理相机测试录像；--dry-run 只预览，正在使用的录像跳过
   eval                         回归测试：冒烟测试、点击评估、合成下降
 
 例子：
@@ -107,6 +108,10 @@ cmd_video() {
 }
 
 set_camera() {
+  if [[ "$EXPOSURE" == keep ]]; then
+    echo "保持摄像头原有曝光和对焦设置"
+    return
+  fi
   if ! command -v v4l2-ctl >/dev/null; then
     echo "[提示] 没有 v4l2-ctl（sudo apt install v4l-utils），相机参数保持原样"
     return
@@ -114,7 +119,14 @@ set_camera() {
   # 不同相机、不同内核的控件名不一样，两种写法都试，失败不影响运行
   v4l2-ctl -d "$DEV" -c focus_automatic_continuous=0 2>/dev/null || v4l2-ctl -d "$DEV" -c focus_auto=0 2>/dev/null \
     || echo "[提示] 没能关闭自动对焦（相机可能是定焦）"
-  if [[ "$EXPOSURE" != auto ]]; then
+  if [[ "$EXPOSURE" == auto ]]; then
+    { v4l2-ctl -d "$DEV" -c auto_exposure=3 2>/dev/null \
+      || v4l2-ctl -d "$DEV" -c exposure_auto=3 2>/dev/null \
+      || v4l2-ctl -d "$DEV" -c auto_exposure=0 2>/dev/null \
+      || v4l2-ctl -d "$DEV" -c exposure_auto=0 2>/dev/null; } \
+      && echo "已开启自动曝光" \
+      || echo "[提示] 没能开启自动曝光，用 v4l2-ctl -d $DEV -l 查看控件名"
+  else
     { v4l2-ctl -d "$DEV" -c auto_exposure=1 -c exposure_time_absolute="$EXPOSURE" 2>/dev/null \
       || v4l2-ctl -d "$DEV" -c exposure_auto=1 -c exposure_absolute="$EXPOSURE" 2>/dev/null; } \
       && echo "曝光设为 $EXPOSURE x 100 us" \
@@ -191,6 +203,52 @@ while True:
 PYEOF
 }
 
+cmd_clean() {
+  "$PY" - "$REC_DIR" "$@" <<'PYEOF'
+import argparse
+from pathlib import Path
+import re
+import shutil
+import subprocess
+
+ap = argparse.ArgumentParser(prog='./run.sh clean', usage='%(prog)s [--dry-run]', description='清理相机测试录像，保留日志并跳过正在使用的文件。')
+ap.add_argument('directory', help=argparse.SUPPRESS)
+ap.add_argument('--dry-run', action='store_true', help='只列出待删除录像')
+a = ap.parse_args()
+root = Path(a.directory).expanduser().resolve()
+if not root.is_dir():
+    print(f'录像目录不存在：{root}')
+    raise SystemExit(0)
+fuser = shutil.which('fuser')
+if fuser is None:
+    ap.error('缺少 fuser，无法检查录像占用；请安装 psmisc 后重试')
+
+count = size = skipped = failures = 0
+print(f'清理目录：{root}')
+for p in sorted(root.iterdir()):
+    if p.is_symlink() or not p.is_file() or not re.fullmatch(r'raw_\d{8}_\d{6}\.avi', p.name):
+        continue
+    busy = subprocess.run([fuser, '-s', str(p)], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if busy.returncode != 1 or busy.stderr:
+        print(f'跳过（正在使用或无法确认占用）：{p.name}')
+        skipped += 1
+        continue
+    try:
+        length = p.stat().st_size
+        if not a.dry_run:
+            p.unlink()
+    except OSError as e:
+        print(f'处理失败：{p.name}：{e}')
+        failures += 1
+        continue
+    count += 1
+    size += length
+    print(f'{"将删除" if a.dry_run else "已删除"}：{p.name}（{length / 1024**2:.1f} MiB）')
+print(f'{"待删除" if a.dry_run else "已删除"} {count} 个视频，共 {size / 1024**2:.1f} MiB；跳过 {skipped} 个，失败 {failures} 个。')
+raise SystemExit(1 if failures else 0)
+PYEOF
+}
+
 cmd_eval() {
   need_lib
   echo "== 冒烟测试 =="
@@ -204,7 +262,7 @@ cmd_eval() {
 }
 
 case "${1:-help}" in
-  setup|image|video|camera|click|height|reset|listen|eval) c="$1"; shift; "cmd_$c" "$@" ;;
+  setup|image|video|camera|click|height|reset|listen|clean|eval) c="$1"; shift; "cmd_$c" "$@" ;;
   help|-h|--help) cmd_help ;;
   *) echo "未知命令：$1"; echo; cmd_help; exit 1 ;;
 esac

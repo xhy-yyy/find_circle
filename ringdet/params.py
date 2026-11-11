@@ -52,11 +52,12 @@ class SearchParams:
     ed_local_margin: float = 2.2       # 小块半边长 = margin * r
     ed_local_center_tol: Tuple[float, float] = (1.5, 0.15)   # 圆心吻合：<= max(a, b*r)
     ed_local_radius_tol: float = 0.15
-    # 匹配滤波：EDCircles 之后用剩下的时间预算，补高空细环、断续的环
+    # 匹配滤波补高空细环、断续环；点击后与 EDCircles 交替优先运行。
     use_matched_filter: bool = True
-    # 点击：100 m 往往看不清环，操作员点一下大致位置，飞机朝那里下降。
-    # 搜索框跟着地面运动搬运、随下降放大；框内一直没找到时逐级扩大，但不扩到全图，避免锁到别处。
+    # 点击后优先扫描附近的小环；搜索框随地面运动搬运，持续无候选时逐级扩大。
     click_box: float = 600.0     # 点击搜索框初始边长（原图 px）
+    click_r_min: float = 4.0     # 点击先验下的小环搜索下限，不改变无点击搜索范围
+    click_tile: int = 192        # 点击搜索任务的有效区边长，按离点击点的距离轮询
     escalate_s: float = 3.0      # 框内这么久没有候选通过复核就扩大一级
     click_max_levels: int = 1    # 最多扩大几级（每级边长 x2）；0 = 只在初始框里找
     click_only: bool = True      # True：没点击就不搜索（输出 LOST）；False：没点击时全图搜索
@@ -141,6 +142,7 @@ class TrackParams:
     reacq_confirm_hits: int = 3
     reacq_weak_hits: int = 5
     template_update_hits: int = 8  # 重捕后通过稳定测量才更新身份参考
+    learn_rate: float = 0.15     # 可靠测量的工作模板、形状和运动统计更新率
 
 
 @dataclass

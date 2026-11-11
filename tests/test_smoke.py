@@ -195,6 +195,8 @@ def test_identity_probation_keeps_valid_continuous_tracking(monkeypatch):
         result = tracker.process(image, i / 30, i)
     assert result.state == 'DETECTED'
     references = [ref['image'].copy() for ref in tracker.references]
+    working = tracker.template['image'].copy()
+    observation = tracker.learned['observation'].copy()
     tracker.template_hold = tracker.P.track.template_update_hits
     monkeypatch.setattr(tracker, '_recovery_identity', lambda *_: False)
     for i in range(12, 24):
@@ -203,6 +205,8 @@ def test_identity_probation_keeps_valid_continuous_tracking(monkeypatch):
         assert math.dist(result.center_px, (320, 180)) < 1.5
     assert tracker.template_hold == tracker.P.track.template_update_hits
     assert len(tracker.references) == len(references)
+    np.testing.assert_array_equal(tracker.template['image'], working)
+    np.testing.assert_array_equal(tracker.learned['observation'], observation)
     for ref, original in zip(tracker.references, references):
         np.testing.assert_array_equal(ref['image'], original)
 
@@ -269,3 +273,80 @@ def test_click_can_replace_identity_even_near_current_target():
     result = tracker.process(image, 12 / 30, 12)
     assert result.click_px is not None
     assert not tracker.references
+    assert tracker.learned is None
+
+
+@pytest.mark.parametrize('offset', [(65, -40), (220, 80)])
+@pytest.mark.parametrize('height', [None, 100])
+def test_click_locks_small_ring_without_descent(offset, height):
+    rng = np.random.default_rng(51)
+    image = synth.ground_texture(360, 640, rng, amp=10)
+    synth.draw_ring(image, 300.3, 190.2, 5.5, 0.9, 85)
+    tracker = RingTracker(Params(), Camera.default(640, 360, fx=550))
+    tracker.set_height(height)
+    tracker.set_click(300.3 + offset[0], 190.2 + offset[1])
+    for i in range(24):
+        frame = synth.degrade(image, rng, blur=0.55, noise=1, jpeg=85)
+        result = tracker.process(frame, i / 30, i)
+        if result.state == 'DETECTED':
+            break
+    assert result.state == 'DETECTED'
+    assert math.dist(result.center_px, (300.3, 190.2)) < 1
+    assert abs(result.radius_px - 5.5) < 1
+
+
+@pytest.mark.parametrize('seed', [52, 53, 54])
+def test_static_clutter_near_click_does_not_lock(seed):
+    rng = np.random.default_rng(seed)
+    image, _ = synth.scene(rng, size=(640, 360), r=6, ring=False)
+    tracker = RingTracker(Params(), Camera.default(640, 360))
+    tracker.set_click(320, 180)
+    for i in range(12):
+        frame = np.clip(image.astype(np.int16) + rng.integers(-1, 2, image.shape), 0, 255).astype(np.uint8)
+        assert tracker.process(frame, i / 30, i).state == 'LOST'
+
+
+def test_learned_motion_supports_tracking_without_optical_flow(monkeypatch):
+    rng = np.random.default_rng(55)
+    image = synth.ground_texture(360, 640, rng)
+    synth.draw_ring(image, 240, 180, 14, 1.5, 80)
+    image = synth.degrade(image, rng)
+    tracker = RingTracker(Params(), Camera.default(640, 360))
+    tracker.set_click(240, 180)
+    for i in range(16):
+        frame = cv2.warpAffine(image, np.float32([[1, 0, 5 * i], [0, 1, 0]]), (640, 360))
+        result = tracker.process(frame, i / 30, i)
+    assert result.state == 'DETECTED'
+    assert tracker.learned['hits'] >= 3
+    assert tracker.learned['velocity'][0] > 90
+    monkeypatch.setattr(tracker.motion, 'update', lambda _: None)
+    monkeypatch.setattr(tracker, '_template_measure', lambda *_: None)
+    for i in range(16, 19):
+        frame = cv2.warpAffine(image, np.float32([[1, 0, 5 * i], [0, 1, 0]]), (640, 360))
+        result = tracker.process(frame, i / 30, i)
+        assert result.state == 'DETECTED' and result.target_id == 1
+        assert math.dist(result.center_px, (240 + 5 * i, 180)) < 1
+
+
+def test_protected_memory_recovers_when_working_template_is_unusable(monkeypatch):
+    rng = np.random.default_rng(56)
+    image = synth.ground_texture(360, 640, rng)
+    synth.draw_ring(image, 320, 180, 18, 2, 75)
+    image = synth.degrade(image, rng)
+    tracker = RingTracker(Params(), Camera.default(640, 360))
+    tracker.set_click(320, 180)
+    for i in range(12):
+        result = tracker.process(image, i / 30, i)
+    assert result.state == 'DETECTED' and tracker.references
+    reference = tracker.references[0]['image'].copy()
+    tracker.template['image'] = rng.integers(0, 256, tracker.template['image'].shape, dtype=np.uint8)
+    tracker.P.search.use_edcircles = False
+    tracker.P.search.use_matched_filter = False
+    monkeypatch.setattr(tracker.motion, 'update', lambda _: None)
+    shifted = cv2.warpAffine(image, np.float32([[1, 0, 70], [0, 1, 0]]), (640, 360))
+    for i in range(12, 15):
+        result = tracker.process(shifted, i / 30, i)
+        assert (result.state == 'DETECTED') == (i == 14)
+    assert result.target_id == 1
+    assert math.dist(result.center_px, (390, 180)) < 1.5
+    np.testing.assert_array_equal(tracker.references[0]['image'], reference)

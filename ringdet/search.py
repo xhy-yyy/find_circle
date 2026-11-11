@@ -113,7 +113,7 @@ class RingSearcher:
         a3 = ring_bands(max(radii_level), ratio, S.m_band_min, S.side_band_min)[3]
         return int(math.ceil(a3)) + 2
 
-    def plan(self, region, img_size, r_lo, r_hi):
+    def plan(self, region, img_size, r_lo, r_hi, tile=None):
         """region: 原图 (x0, y0, x1, y1)。返回覆盖该区域、该半径范围的全部分块。"""
         W, H = img_size
         jobs = []
@@ -127,8 +127,8 @@ class RingSearcher:
             if rx1 <= rx0 or ry1 <= ry0:
                 continue
             m = self._margin(rl)
-            tw = min(self.P.search.tile, cv2.getOptimalDFTSize(rx1 - rx0 + 2 * m))
-            th = min(self.P.search.tile, cv2.getOptimalDFTSize(ry1 - ry0 + 2 * m))
+            tw = min(tile or self.P.search.tile, cv2.getOptimalDFTSize(rx1 - rx0 + 2 * m))
+            th = min(tile or self.P.search.tile, cv2.getOptimalDFTSize(ry1 - ry0 + 2 * m))
             vw, vh = tw - 2 * m, th - 2 * m
             n = self.P.search.radii_per_job
             chunks = [tuple(rl[i:i + n]) for i in range(0, len(rl), n)]
@@ -246,15 +246,19 @@ def plan_ed(region, img_size, r_hi, cell_size):
     return jobs
 
 
-def run_ed(gray_u8, job, r_lo, r_hi, S):
+def run_ed(gray_u8, job, r_lo, r_hi, S, zoom=1.0):
     """在 job.crop 上跑 EDCircles（ED_Lib），按半径范围和轴比筛选，返回候选。"""
     x0, y0, x1, y1 = job.crop
-    d = edc.detect(gray_u8[y0:y1, x0:x1], grad=S.ed_gradient, anchor=S.ed_anchor, sigma=S.ed_sigma,
+    crop = gray_u8[y0:y1, x0:x1]
+    if zoom != 1.0:
+        crop = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(crop)
+        crop = cv2.resize(crop, None, fx=zoom, fy=zoom, interpolation=cv2.INTER_CUBIC)
+    d = edc.detect(crop, grad=S.ed_gradient, anchor=S.ed_anchor, sigma=S.ed_sigma,
                    min_path=S.ed_min_path, validate=S.ed_validate, prefer=S.ed_backend)
     out = []
     for cx, cy, a, b, _, _ in d:
-        cx, cy = cx + x0, cy + y0
-        r = (a + b) / 2
+        cx, cy = (cx + 0.5) / zoom - 0.5 + x0, (cy + 0.5) / zoom - 0.5 + y0
+        r = (a + b) / (2 * zoom)
         if not (r_lo / 1.15 <= r <= r_hi * 1.15):
             continue
         if min(a, b) < S.ed_min_axis_ratio * max(a, b):   # 太扁的不是下视的圆环
@@ -279,17 +283,19 @@ def confirm_ed(gray_u8, x, y, r, S):
     crop = get_patch(gray_u8, x0, y0, x1 - x0, y1 - y0)
     if crop is None:
         return False
-    big = cv2.resize(np.ascontiguousarray(crop), None, fx=k, fy=k, interpolation=cv2.INTER_CUBIC)
     tol_c = max(S.ed_local_center_tol[0], S.ed_local_center_tol[1] * r)
-    for cx, cy, a, b, _, _ in edc.detect(big, grad=S.ed_gradient, anchor=S.ed_anchor, sigma=S.ed_sigma,
-                                          min_path=S.ed_min_path, validate=S.ed_validate, prefer=S.ed_backend):
-        if min(a, b) < S.ed_min_axis_ratio * max(a, b):
-            continue
-        cx = (cx + 0.5) / k - 0.5 + x0
-        cy = (cy + 0.5) / k - 0.5 + y0
-        rr = (a + b) / 2 / k
-        if math.hypot(cx - x, cy - y) <= tol_c and abs(rr - r) <= S.ed_local_radius_tol * r:
-            return True
+    for enhance in (False, True) if k > 1 else (False,):
+        patch = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4)).apply(crop) if enhance else crop
+        big = cv2.resize(np.ascontiguousarray(patch), None, fx=k, fy=k, interpolation=cv2.INTER_CUBIC)
+        for cx, cy, a, b, _, _ in edc.detect(big, grad=S.ed_gradient, anchor=S.ed_anchor, sigma=S.ed_sigma,
+                                              min_path=S.ed_min_path, validate=S.ed_validate, prefer=S.ed_backend):
+            if min(a, b) < S.ed_min_axis_ratio * max(a, b):
+                continue
+            cx = (cx + 0.5) / k - 0.5 + x0
+            cy = (cy + 0.5) / k - 0.5 + y0
+            rr = (a + b) / 2 / k
+            if math.hypot(cx - x, cy - y) <= tol_c and abs(rr - r) <= S.ed_local_radius_tol * r:
+                return True
     return False
 
 
