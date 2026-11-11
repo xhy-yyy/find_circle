@@ -219,6 +219,7 @@ class RingTracker:
     # ---------- 主流程 ----------
     def process(self, frame, stamp, frame_id=0):
         t0 = time.perf_counter()
+        self._stamp = stamp
         self._deadline = t0 + self.P.track.frame_budget_ms / 1000
         self._identity_cache = {}
         self.searcher.begin_frame()
@@ -277,6 +278,8 @@ class RingTracker:
             A[:2] = T.A
             self._ed_meta['A'] = A @ self._ed_meta['A']
         s = T.scale
+        if self.reference_radius is not None:
+            self.reference_radius *= s
         for c in self.cands:
             c.cx, c.cy = T.apply(c.cx, c.cy)
             c.r *= s
@@ -578,6 +581,8 @@ class RingTracker:
             return None
         cx, cy, r = self.tgt
         TP, V = self.P.track, self.P.verify
+        # 弱测量可能缩小半径，重捕保留随地面运动传播的可靠尺度。
+        r = max(r, self.reference_radius or r)
         age = max(0.0, stamp - self.last_detect)
         half = max(TP.reacq_box_min / 2, TP.reacq_box_r * r / 2) * min(3.0, 1 + age)
         H, W = fr.shape
@@ -717,13 +722,14 @@ class RingTracker:
                 self.ed_cursor = 0
             else:
                 k = TP.reacq_radius if el <= TP.reacq_expand_s else 2 * TP.reacq_radius
-                r_lo, r_hi = q['r'] * (1 - k), q['r'] * (1 + k)
+                expected_r = max(q['r'], self.reference_radius or q['r'])
+                r_lo, r_hi = q['r'] * (1 - k), expected_r * (1 + k)
                 if el <= TP.reacq_expand_s:
                     h = max(TP.reacq_box_min / 2, TP.reacq_box_r * q['r'] / 2) * (1 + el)
                     region = (q['x'] - h, q['y'] - h, q['x'] + h, q['y'] + h)
                 else:
                     region = (0, 0, W, H)
-                return region, r_lo, r_hi, (q['x'], q['y']), q['r']
+                return region, r_lo, r_hi, (q['x'], q['y']), expected_r
         S = self.P.search
         if self.height:
             r0 = self.cam.fx * (self.P.ring.diameter_m / 2) / self.height
@@ -759,7 +765,15 @@ class RingTracker:
         P, V, TP = self.P, self.P.verify, self.P.track
         S = P.search
         deadline = min(self._deadline, time.perf_counter() + S.budget_ms / 1000)
-        if self.phase == REACQUIRE:
+        H, W = fr.shape
+        region, r_lo, r_hi, ref, ref_r = self._region(W, H)
+        region = (max(0, region[0]), max(0, region[1]), min(W, region[2]), min(H, region[3]))
+        self.dbg['region'] = region
+        self.dbg['r_range'] = (r_lo, r_hi)
+        # 长时丢失定期留出几何搜索帧，避免模板匹配耗尽预算。
+        try_template = (self.recovery_candidate is not None or self.n_frames % 3 != 0
+                        or self.last_detect is None or stamp - self.last_detect <= TP.coast_s)
+        if self.phase == REACQUIRE and try_template:
             m = self._template_measure(fr, stamp)
             if self.ambiguous:
                 self.recovery_candidate = None
@@ -771,12 +785,6 @@ class RingTracker:
             self.recovery_candidate = None
         if time.perf_counter() >= deadline:
             return
-        H, W = fr.shape
-        self._stamp = stamp
-        region, r_lo, r_hi, ref, ref_r = self._region(W, H)
-        region = (max(0, region[0]), max(0, region[1]), min(W, region[2]), min(H, region[3]))
-        self.dbg['region'] = region
-        self.dbg['r_range'] = (r_lo, r_hi)
         if region[2] <= region[0] or region[3] <= region[1]:
             self.pending = []
             return

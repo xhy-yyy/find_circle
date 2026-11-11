@@ -4,6 +4,7 @@ import os
 import sys
 import shutil
 import threading
+import time
 from concurrent.futures import Future
 
 import numpy as np
@@ -212,6 +213,50 @@ def test_identity_probation_keeps_valid_continuous_tracking(monkeypatch):
     np.testing.assert_array_equal(tracker.learned['observation'], observation)
     for ref, original in zip(tracker.references, references):
         np.testing.assert_array_equal(ref['image'], original)
+
+
+def test_recovery_uses_trusted_scale_after_weak_radius_shrink(monkeypatch):
+    rng = np.random.default_rng(67)
+    image = synth.ground_texture(360, 640, rng)
+    synth.draw_ring(image, 320, 180, 18, 2, 75)
+    image = synth.degrade(image, rng)
+    tracker = RingTracker(Params(), Camera.default(640, 360))
+    tracker.set_click(320, 180)
+    for i in range(12):
+        result = tracker.process(image, i / 30, i)
+    assert result.state == 'DETECTED'
+    tracker.tgt[2] *= .72
+    monkeypatch.setattr(tracker.motion, 'update', lambda _: None)
+    for i in range(12, 15):
+        result = tracker.process(image, i / 30, i)
+    assert result.state == 'DETECTED' and result.target_id == 1
+    assert math.dist(result.center_px, (320, 180)) < 1.5
+    assert abs(result.radius_px - 18) < 1.5
+    tracker.close()
+
+
+def test_expensive_template_cannot_starve_search_or_timeout(monkeypatch):
+    tracker = RingTracker(Params(), Camera.default(320, 180))
+    tracker.phase = 'REACQUIRE'
+    tracker.tgt = [160., 90., 12.]
+    tracker.last_detect = 0.
+    tracker.reacq = dict(start=0., x=160., y=90., r=12.)
+    tracker.P.track.frame_budget_ms = 2
+    tracker.P.search.use_edcircles = False
+    tracker.P.search.use_matched_filter = False
+    monkeypatch.setattr(tracker.motion, 'update', lambda _: None)
+    def slow_match(*_):
+        time.sleep(.005)
+        return None
+    monkeypatch.setattr(tracker, '_template_measure', slow_match)
+    image = np.zeros((180, 320), np.uint8)
+    results = [tracker.process(image, 1.1 + i / 30, i) for i in range(3)]
+    assert any('jobs' in result.debug for result in results)
+    tracker.P.track.frame_budget_ms = 0
+    result = tracker.process(image, 3.1, 3)
+    assert result.state == 'LOST' and result.phase == 'SEARCH'
+    assert tracker.r_floor is not None
+    tracker.close()
 
 
 def test_pending_recovery_cannot_bypass_confirmation(monkeypatch):
