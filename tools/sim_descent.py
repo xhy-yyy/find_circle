@@ -39,6 +39,7 @@ def main():
                                 occlude=occ, hide=hide, exit_frames=int(n * 0.1))
     P = Params()
     trk = RingTracker(P, Camera.default(*size))
+    trk.warmup()
     writer = None
     if a.save:
         writer = cv2.VideoWriter(a.save, cv2.VideoWriter_fourcc(*'mp4v'), a.fps, size)
@@ -69,6 +70,7 @@ def main():
             writer.write(draw_result(cv2.cvtColor(f, cv2.COLOR_GRAY2BGR), res))
     if writer is not None:
         writer.release()
+    trk.close()
     print('\n状态序列（D=DETECTED P=PREDICTED L=LOST）:')
     for k in range(0, n, 60):
         print(f'  {k:3d}: ' + ''.join(states[k:k + 60]))

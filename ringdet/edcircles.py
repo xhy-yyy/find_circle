@@ -1,6 +1,6 @@
 """EDCircles 候选：调用 ED_Lib（Cihan Topal，MIT）的 C++ 实现。
 
-库文件 ringdet/_lib/libedcircles.so 由 ./build.sh 编译（只依赖 OpenCV core/imgproc）。
+库文件 ringdet/_lib/libedcircles.so 由 ./build.sh 编译，使用 OpenCV core/imgproc/video。
 没有编译时退回 opencv-contrib 的 cv2.ximgproc.EdgeDrawing（同源移植），两个都没有就不可用。
 """
 from __future__ import annotations
@@ -9,6 +9,7 @@ import ctypes
 import math
 import os
 import sys
+import threading
 
 import numpy as np
 import cv2
@@ -16,6 +17,7 @@ import cv2
 _OPS = {'prewitt': 0, 'sobel': 1, 'scharr': 2, 'lsd': 3}
 _lib = None
 _lib_err = None
+_detect_lock = threading.Lock()  # ED_Lib 的 NFA 查表含共享状态。
 
 
 def _load():
@@ -38,6 +40,14 @@ def _load():
                 ctypes.c_int, ctypes.c_double, ctypes.c_int, ctypes.c_int,
                 ctypes.c_void_p, ctypes.c_int]
             lib.edc_version.restype = ctypes.c_char_p
+            if hasattr(lib, 'edc_flow_fb'):
+                lib.edc_flow_fb.restype = ctypes.c_int
+                lib.edc_flow_fb.argtypes = [ctypes.c_void_p, ctypes.c_void_p] + [ctypes.c_int] * 4 + [
+                    ctypes.c_void_p, ctypes.c_int] + [ctypes.c_void_p] * 4
+            if hasattr(lib, 'edc_ellipse_hypotheses'):
+                lib.edc_ellipse_hypotheses.restype = ctypes.c_int
+                lib.edc_ellipse_hypotheses.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
+                    ctypes.c_int, ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_void_p, ctypes.c_void_p]
             _lib = lib
             _lib_err = None
             return _lib
@@ -64,14 +74,43 @@ def describe():
     return f'不可用：{_lib_err}'
 
 
+def flow_fb(prev, current, points):
+    lib = _load()
+    if lib is None or not hasattr(lib, 'edc_flow_fb'):
+        return None
+    points = np.ascontiguousarray(points, np.float32)
+    nxt, back = np.empty_like(points), np.empty_like(points)
+    forward, backward = np.empty(len(points), np.uint8), np.empty(len(points), np.uint8)
+    h, w = prev.shape
+    rc = lib.edc_flow_fb(prev.ctypes.data, current.ctypes.data, w, h, prev.strides[0], current.strides[0],
+                         points.ctypes.data, len(points), nxt.ctypes.data, back.ctypes.data,
+                         forward.ctypes.data, backward.ctypes.data)
+    return None if rc else (nxt, forward, back, backward)
+
+
+def ellipse_hypotheses(points, samples, radius, tolerance, axis_ratio):
+    lib = _load()
+    if lib is None or not hasattr(lib, 'edc_ellipse_hypotheses'):
+        return None
+    points = np.ascontiguousarray(points, np.float64)
+    samples = np.ascontiguousarray(samples, np.int32)
+    ellipse, mask = np.empty(5, np.float64), np.zeros(len(points), np.uint8)
+    rc = lib.edc_ellipse_hypotheses(points.ctypes.data, len(points), samples.ctypes.data, len(samples),
+                                   radius, tolerance, axis_ratio, ellipse.ctypes.data, mask.ctypes.data)
+    if rc < 0:
+        return None
+    return ellipse, mask.astype(bool)
+
+
 def _detect_edlib(gray, grad, anchor, sigma, min_path, op, scan, validate):
     g = np.ascontiguousarray(gray, np.uint8)
     H, W = g.shape
     cap = 256
     while True:
         out = np.zeros((cap, 6), np.float64)
-        n = _lib.edc_detect(g.ctypes.data, W, H, g.strides[0], _OPS[op], int(grad), int(anchor), int(scan),
-                            int(min_path), float(sigma), 1, int(bool(validate)), out.ctypes.data, cap)
+        with _detect_lock:
+            n = _lib.edc_detect(g.ctypes.data, W, H, g.strides[0], _OPS[op], int(grad), int(anchor), int(scan),
+                                int(min_path), float(sigma), 1, int(bool(validate)), out.ctypes.data, cap)
         if n < 0:
             raise RuntimeError('edc_detect 内部异常')
         if n <= cap:

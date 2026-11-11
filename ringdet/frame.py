@@ -36,6 +36,7 @@ class Frame:
         self._u8 = {'gray': img if img.ndim == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)}
         self._f32 = {}
         self._noise = {}
+        self.last_noise = noise_floor
 
     @property
     def shape(self):
@@ -60,5 +61,6 @@ class Frame:
 
     def noise(self, ch):
         if ch not in self._noise:
-            self._noise[ch] = max(frame_noise(self.f32(ch)), self._floor)
+            self._noise[ch] = max(frame_noise(self.u8(ch)), self._floor)
+        self.last_noise = self._noise[ch]
         return self._noise[ch]

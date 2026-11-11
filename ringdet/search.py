@@ -8,6 +8,7 @@ M/I/O 是中间亮带、内背景带、外背景带的平均亮度。取两侧�
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Tuple
 
@@ -86,13 +87,24 @@ def get_patch(img, x0, y0, w, h):
 class RingSearcher:
     def __init__(self, params):
         self.P = params
-        self._spec = {}
+        self._spec = OrderedDict()
+        self._spec_bytes = 0
+        self._frame_spectra = None
+
+    def begin_frame(self):
+        self._frame_spectra = {}
 
     # ---------- 规划 ----------
     def radii(self, r_lo, r_hi):
         s = self.P.search.r_step
-        n = max(1, int(math.floor(math.log(r_hi / r_lo) / math.log(s))) + 1)
-        rs = r_lo * s ** np.arange(n)
+        base = min(self.P.search.r_min, self.P.search.click_r_min)
+        low = int(math.ceil(math.log(r_lo / base) / math.log(s) - 1e-9))
+        high = int(math.floor(math.log(r_hi / base) / math.log(s) + 1e-9))
+        if high < low:
+            return np.array([math.sqrt(r_lo * r_hi)])
+        rs = base * s ** np.arange(low, high + 1)
+        if rs[0] > r_lo * math.sqrt(s):
+            rs = np.insert(rs, 0, r_lo)
         if rs[-1] < r_hi / math.sqrt(s):
             rs = np.append(rs, r_hi)
         return rs
@@ -154,23 +166,38 @@ class RingSearcher:
             buf[:n, :n, 1] = kmo
             buf = np.roll(buf, (-half, -half), axis=(0, 1))   # 核中心放到 (0,0)
             sp = cv2.dft(buf, flags=cv2.DFT_COMPLEX_OUTPUT)
-            self._spec[key] = sp
+            capacity = max(0, self.P.search.fft_cache_mb) * 1024 ** 2
+            while self._spec and self._spec_bytes + sp.nbytes > capacity:
+                _, old = self._spec.popitem(last=False)
+                self._spec_bytes -= old.nbytes
+            if sp.nbytes <= capacity:
+                self._spec[key] = sp
+                self._spec_bytes += sp.nbytes
+        else:
+            self._spec.move_to_end(key)
         return sp
 
     def score_maps(self, level_img, job):
         """返回 (best_score, best_radius_index, sigma)，均为块内坐标。"""
-        patch = get_patch(level_img, job.x0, job.y0, job.w, job.h)
-        if patch is None:
-            return None
-        patch = np.ascontiguousarray(patch, np.float32)
-        vx0, vy0, vx1, vy1 = job.valid
-        core = patch[vy0 - job.y0:vy1 - job.y0, vx0 - job.x0:vx1 - job.x0]
-        sigma = max(noise_sigma(core), self.P.search.noise_floor)
-        F = cv2.dft(patch, flags=cv2.DFT_COMPLEX_OUTPUT)
-        best = np.full(patch.shape, -np.inf, np.float32)
-        arg = np.zeros(patch.shape, np.int16)
+        key = (id(level_img), job.x0, job.y0, job.w, job.h, tuple(job.valid))
+        cached = None if self._frame_spectra is None else self._frame_spectra.get(key)
+        if cached is None:
+            patch = get_patch(level_img, job.x0, job.y0, job.w, job.h)
+            if patch is None:
+                return None
+            patch = np.ascontiguousarray(patch, np.float32)
+            vx0, vy0, vx1, vy1 = job.valid
+            core = patch[vy0 - job.y0:vy1 - job.y0, vx0 - job.x0:vx1 - job.x0]
+            sigma = max(noise_sigma(core), self.P.search.noise_floor)
+            F = cv2.dft(patch, flags=cv2.DFT_COMPLEX_OUTPUT)
+            cached = (F, sigma, patch.shape, level_img)
+            if self._frame_spectra is not None:
+                self._frame_spectra[key] = cached
+        F, sigma, shape, _ = cached
+        best = np.full(shape, -np.inf, np.float32)
+        arg = np.zeros(shape, np.int16)
         for i, r in enumerate(job.radii):
-            out = cv2.idft(cv2.mulSpectrums(F, self._spectrum(r, patch.shape), 0),
+            out = cv2.idft(cv2.mulSpectrums(F, self._spectrum(r, shape), 0),
                            flags=cv2.DFT_SCALE)
             a, b = out[..., 0], out[..., 1]          # M-I, M-O；|I-O| = |a-b|
             s = np.minimum(a, b)
@@ -215,7 +242,7 @@ class RingSearcher:
         return [Candidate(x * k, y * k, r * k, s, job.level) for x, y, r, s in kept]
 
 
-ED_SCORE = 100.0   # EDCircles 候选的分数：圆心半径已经很准，排在匹配滤波候选前面复核
+ED_SCORE = 100.0   # 邻近区域内优先复核 EDCircles 候选。
 
 
 @dataclass

@@ -61,5 +61,8 @@ def draw_result(frame, res):
     if res.ambiguous:
         s += ' AMBIGUOUS'
     text(img, s, (10, 25), color)
-    text(img, f"{d.get('ms', 0):.0f} ms  noise={d.get('noise', 0):.1f}  flow={d.get('motion_inliers', 0)}", (10, 50))
+    timing = f"{d.get('ms', 0):.0f} ms  noise={d.get('noise', 0):.1f}  flow={d.get('motion_inliers', 0)}"
+    if d.get('fps', 0) > 0:
+        timing += f"  {d['fps']:.1f} FPS"
+    text(img, timing, (10, 50))
     return img

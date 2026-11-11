@@ -7,8 +7,12 @@
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <cmath>
+#include <algorithm>
 
 #include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/video/tracking.hpp>
 
 #include "EDLib.h"
 
@@ -69,5 +73,69 @@ EDC_API int edc_detect(const uint8_t* img, int width, int height, int stride,
 }
 
 EDC_API const char* edc_version() { return "ED_Lib@69b8d08"; }
+
+EDC_API int edc_flow_fb(const uint8_t* prev, const uint8_t* current,
+                       int width, int height, int prev_stride, int current_stride,
+                       const float* points, int count, float* next, float* back,
+                       uint8_t* forward_status, uint8_t* backward_status) {
+    if (!prev || !current || !points || count <= 0) return -1;
+    try {
+        cv::Mat a(height, width, CV_8UC1, const_cast<uint8_t*>(prev), prev_stride);
+        cv::Mat b(height, width, CV_8UC1, const_cast<uint8_t*>(current), current_stride);
+        std::vector<cv::Mat> pa, pb;
+        const cv::Size window(21, 21);
+        // 前后向跟踪共享这两幅图的金字塔及梯度。
+        cv::buildOpticalFlowPyramid(a, pa, window, 3);
+        cv::buildOpticalFlowPyramid(b, pb, window, 3);
+        cv::Mat p(count, 1, CV_32FC2, const_cast<float*>(points));
+        cv::Mat q(count, 1, CV_32FC2, next), r(count, 1, CV_32FC2, back);
+        cv::Mat sa(count, 1, CV_8U, forward_status), sb(count, 1, CV_8U, backward_status), error;
+        const cv::TermCriteria criteria(cv::TermCriteria::COUNT | cv::TermCriteria::EPS, 30, 0.01);
+        cv::calcOpticalFlowPyrLK(pa, pb, p, q, sa, error, window, 3, criteria);
+        cv::calcOpticalFlowPyrLK(pb, pa, q, r, sb, error, window, 3, criteria);
+        return 0;
+    } catch (...) {
+        return -1;
+    }
+}
+
+EDC_API int edc_ellipse_hypotheses(const double* points, int count, const int32_t* samples,
+                                 int iterations, double radius, double tolerance,
+                                 double axis_ratio, double* ellipse, uint8_t* mask) {
+    if (!points || !samples || count < 5 || iterations <= 0) return -1;
+    int best = 0;
+    std::vector<uint8_t> inliers(count);
+    std::vector<cv::Point2f> sample(5);
+    // 保持输入假设顺序，内点数相同时保留先出现的结果。
+    for (int k = 0; k < iterations; ++k) {
+        for (int j = 0; j < 5; ++j) {
+            int index = samples[5 * k + j];
+            if (index < 0 || index >= count) return -1;
+            sample[j] = cv::Point2f(points[2 * index], points[2 * index + 1]);
+        }
+        cv::RotatedRect e;
+        try { e = cv::fitEllipseDirect(sample); } catch (...) { continue; }
+        double a = e.size.width / 2.0, b = e.size.height / 2.0;
+        if (!std::isfinite(a) || !std::isfinite(b) || std::min(a, b) < 0.5 * radius
+                || std::max(a, b) > 1.6 * radius || std::min(a, b) < axis_ratio * std::max(a, b)) continue;
+        double angle = e.angle * CV_PI / 180.0;
+        double cs = std::cos(angle), sn = std::sin(angle);
+        int hits = 0;
+        for (int i = 0; i < count; ++i) {
+            double x = points[2 * i] - e.center.x, y = points[2 * i + 1] - e.center.y;
+            double qx = (x * cs + y * sn) / a, qy = (-x * sn + y * cs) / b;
+            double residual = (std::hypot(qx, qy) - 1) * (a + b) / 2;
+            inliers[i] = std::abs(residual) <= tolerance;
+            hits += inliers[i];
+        }
+        if (hits > best) {
+            best = hits;
+            ellipse[0] = e.center.x; ellipse[1] = e.center.y;
+            ellipse[2] = a; ellipse[3] = b; ellipse[4] = e.angle;
+            std::copy(inliers.begin(), inliers.end(), mask);
+        }
+    }
+    return best;
+}
 
 }  // extern "C"

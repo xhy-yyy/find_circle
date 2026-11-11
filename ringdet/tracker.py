@@ -6,7 +6,8 @@ from __future__ import annotations
 
 import math
 import time
-from collections import deque
+from collections import deque, OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, asdict
 from typing import Optional, Tuple
 
@@ -18,7 +19,7 @@ from .motion import GroundMotion
 from .params import Params
 from . import edcircles as edc
 from .frame import Frame, frame_noise, noise_sigma  # noqa: F401  frame_noise 供工具脚本导入
-from .search import RingSearcher, build_pyramid, merge_candidates, plan_ed, run_ed, confirm_ed, ED_SCORE
+from .search import RingSearcher, EdJob, build_pyramid, merge_candidates, plan_ed, run_ed, confirm_ed, ED_SCORE
 from .verify import measure, _delta
 
 SEARCH, TRACK, COAST, REACQUIRE = 'SEARCH', 'TRACK', 'COAST', 'REACQUIRE'
@@ -61,6 +62,7 @@ class _Cand:
         self.hits = deque([True], maxlen=window)
         self.meas = m
         self.last_pass = stamp
+        self.created = stamp
         self.ed_hits = int(m.ed_ok)            # 有几帧得到 EDCircles 支持（全图检出或候选级放大检出）
 
 
@@ -68,7 +70,7 @@ def measure_channels(fr, cam, cx, cy, r, V, mode, delta=None, local=False):
     """按 V.channels 的顺序在各通道复核，第一个通过的返回；都不过时返回第一个通道的结果。"""
     first = None
     for ch in fr.channels(V.channels):
-        noise = fr.noise(ch)
+        noise = fr._floor if local else fr.noise(ch)
         if local:
             H, W = fr.shape
             half = int(math.ceil(2 * r + _delta(V.delta_search, r) + 8))
@@ -76,6 +78,7 @@ def measure_channels(fr, cam, cx, cy, r, V, mode, delta=None, local=False):
                                max(0, int(cx) - half):min(W, int(cx) + half + 1)]
             if min(patch.shape) >= 3:
                 noise = max(noise_sigma(patch), fr._floor)
+        fr.last_noise = noise
         m = measure(fr.f32(ch), cam, cx, cy, r, noise, V, mode=mode, delta=delta)
         m.channel = ch
         if m.ok:
@@ -102,10 +105,21 @@ class RingTracker:
         self.motion = GroundMotion(self.P.motion)
         self.height = None
         self.target_id = 0
+        self._ed_pool = None
+        self._ed_future = None
+        self._ed_meta = None
+        self._gpu_matcher = None
+        self._gpu_match_roi = self._gpu_match_template = None
+        self.template_backend = 'cpu'
+        self.template_backend_error = ''
+        if self.P.track.template_backend not in ('auto', 'cpu', 'cuda'):
+            raise ValueError('track.template_backend 必须是 auto、cpu 或 cuda')
         self.reset()
 
     # ---------- 外部输入 ----------
     def reset(self):
+        if self._ed_meta is not None:
+            self._ed_meta['valid'] = False
         self.phase = SEARCH
         self.cands = []
         self.tgt = None            # [cx, cy, r]，当前帧坐标
@@ -115,6 +129,7 @@ class RingTracker:
         self.reacq = None
         self.r_floor = None        # 丢失后的半径下限（见 track.lost_r_floor）
         self.cursor = 0
+        self.focus_cursor = 0
         self.ed_cursor = 0
         self.n_frames = 0
         self._pending_click = None
@@ -129,7 +144,69 @@ class RingTracker:
         self.learned = None
         self._template_frame = -1
         self._template_result = None
+        self._match_cache = OrderedDict()
+        self._match_cache_bytes = 0
         self.motion.reset()
+
+    def close(self):
+        if self._ed_pool is not None:
+            if self._ed_future is not None:
+                self._ed_future.cancel()
+            self._ed_pool.shutdown(wait=True)
+            self._ed_pool = None
+        self._ed_future = None
+        self._ed_meta = None
+
+    def warmup(self):
+        S = self.P.search
+        if S.use_matched_filter and S.fft_cache_mb > 0:
+            side = S.click_tile + 64
+            for radii in self.searcher._split_levels(self.searcher.radii(
+                    min(S.r_min, S.click_r_min), max(S.r_min, min(S.r_max, 60)))).values():
+                for radius in radii:
+                    self.searcher._spectrum(radius, (side, side))
+        if self.motion.backend == 'cuda':
+            image = np.zeros((180, 320), np.uint8)
+            self.motion._corners(image, self.P.motion.max_corners, self.P.motion.min_distance)
+            points = np.array([[[64., 64.]], [[128., 96.]], [[200., 120.]]], np.float32)
+            self.motion._flow(image, image, points)
+            self.motion.reset()
+        if self.motion.backend == 'cuda' or self.P.track.template_backend == 'cuda':
+            image = (np.arange(180 * 320).reshape(180, 320) % 251).astype(np.uint8)
+            self._match_templates(image, [image[20:37, 30:47].copy()] * 3)
+
+    def _poll_ed(self, stamp):
+        if self._ed_future is None or not self._ed_future.done():
+            return []
+        future, meta = self._ed_future, self._ed_meta
+        self._ed_future = self._ed_meta = None
+        try:
+            found = future.result()
+        except Exception as e:
+            self.dbg['ed_error'] = str(e)
+            return []
+        if not meta['valid'] or stamp - meta['stamp'] > 0.25:
+            return []
+        A = meta['A']
+        scale = math.hypot(A[0, 0], A[1, 0])
+        for c in found:
+            c.x, c.y = A[:2, :2] @ (c.x, c.y) + A[:2, 2]
+            c.r *= scale
+        return found
+
+    def _submit_ed(self, fr, job, ch, r_lo, r_hi, zoom, stamp):
+        if self._ed_future is not None:
+            return False
+        if self._ed_pool is None:
+            self._ed_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='ring-ed')
+        x0, y0, x1, y1 = job.crop
+        crop = fr.u8(ch)[y0:y1, x0:x1].copy()
+        cell = (job.cell[0] - x0, job.cell[1] - y0, job.cell[2] - x0, job.cell[3] - y0)
+        local = EdJob(cell, (0, 0, x1 - x0, y1 - y0))
+        self._ed_meta = dict(valid=True, stamp=stamp,
+                             A=np.array([[1., 0., x0], [0., 1., y0], [0., 0., 1.]]))
+        self._ed_future = self._ed_pool.submit(run_ed, crop, local, r_lo, r_hi, self.P.search, zoom)
+        return True
 
     def set_click(self, x, y):
         """G30 点击，已换算成原图 px。下一帧生效。"""
@@ -142,6 +219,9 @@ class RingTracker:
     # ---------- 主流程 ----------
     def process(self, frame, stamp, frame_id=0):
         t0 = time.perf_counter()
+        self._deadline = t0 + self.P.track.frame_budget_ms / 1000
+        self._identity_cache = {}
+        self.searcher.begin_frame()
         fr = Frame(frame, self.P.search.noise_floor)
         gray_u8 = fr.u8('gray')
         H, W = gray_u8.shape
@@ -151,7 +231,7 @@ class RingTracker:
             raise ValueError(f'相机参数分辨率 {self.cam.size} 与图像 {(W, H)} 不一致')
         self.n_frames += 1
         previous = None if self.tgt is None else tuple(self.tgt)
-        noise = fr.noise('gray')
+        noise = fr._floor
         self.motion.focus = self.tgt
         if self.tgt is None and self.click is not None:
             self.motion.focus = (self.click['x'], self.click['y'], self.P.search.click_tile / 5)
@@ -180,13 +260,22 @@ class RingTracker:
             self._step_track(fr, T, stamp)
         if self.phase in (SEARCH, REACQUIRE):
             self._step_search(fr, T, stamp)
+        self.dbg['noise'] = fr.last_noise
+        self.dbg['motion_backend'] = self.motion.backend
+        self.dbg['template_backend'] = self.template_backend
         self.dbg['cands'] = [(c.cx, c.cy, c.r, int(sum(c.hits))) for c in self.cands]
         self.dbg['ms'] = (time.perf_counter() - t0) * 1000
         return self._result(frame_id, stamp)
 
     def _propagate(self, T):
         if T is None:
+            if self._ed_meta is not None:
+                self._ed_meta['valid'] = False
             return
+        if self._ed_meta is not None:
+            A = np.eye(3)
+            A[:2] = T.A
+            self._ed_meta['A'] = A @ self._ed_meta['A']
         s = T.scale
         for c in self.cands:
             c.cx, c.cy = T.apply(c.cx, c.cy)
@@ -214,6 +303,8 @@ class RingTracker:
             self.reacq['r'] *= s
 
     def _apply_click(self, stamp):
+        if self._ed_meta is not None:
+            self._ed_meta['valid'] = False
         x, y = self._pending_click
         self._pending_click = None
         self.phase = SEARCH
@@ -232,7 +323,10 @@ class RingTracker:
         self.learned = None
         self._template_frame = -1
         self._template_result = None
+        self._match_cache.clear()
+        self._match_cache_bytes = 0
         self.cursor = 0
+        self.focus_cursor = 0
         self.ed_cursor = 0
         self.click = dict(x=x, y=y, side=self.P.search.click_box, level=0, t_level=stamp, scale=1.0)
 
@@ -293,6 +387,9 @@ class RingTracker:
     def _reference_score(self, fr, m):
         if not self.references:
             return 1.0
+        key = (m.cx, m.cy, m.r, tuple(id(ref) for ref in self.references))
+        if key in self._identity_cache:
+            return self._identity_cache[key]
         H, W = fr.shape
         scores = []
         for ref in self.references:
@@ -314,7 +411,88 @@ class RingTracker:
                     patch = cv2.warpAffine(patch, A, (count, count), borderMode=cv2.BORDER_REFLECT_101)
                 best = max(best, cv2.minMaxLoc(cv2.matchTemplate(patch, ref['image'], cv2.TM_CCOEFF_NORMED))[1])
             scores.append(best)
-        return max(scores)
+        score = max(scores)
+        self._identity_cache[key] = score
+        return score
+
+    def _match_templates(self, roi, templates):
+        """共享图像频谱和积分图，计算各模板的归一化互相关。"""
+        if not templates:
+            return []
+        h, w = roi.shape
+        backend = self.P.track.template_backend
+        self.template_backend = 'cpu'
+        if (backend != 'cpu' and self._gpu_matcher is not False and roi.dtype == np.uint8
+                and min(h, w) >= 128 and (backend == 'cuda' or self.motion.backend == 'cuda')):
+            try:
+                if self._gpu_matcher is None:
+                    factory = getattr(cv2.cuda, 'createTemplateMatching', None)
+                    if factory is None or cv2.cuda.getCudaEnabledDeviceCount() < 1:
+                        raise RuntimeError('OpenCV 未提供可用的 CUDA 模板匹配')
+                    self._gpu_matcher = factory(cv2.CV_8UC1, cv2.TM_CCOEFF_NORMED)
+                    self._gpu_match_roi, self._gpu_match_template = cv2.cuda_GpuMat(), cv2.cuda_GpuMat()
+                self._gpu_match_roi.upload(np.ascontiguousarray(roi))
+                maps = []
+                for template in templates:
+                    if np.ptp(template) == 0:
+                        maps.append(np.ones((h - template.shape[0] + 1, w - template.shape[1] + 1), np.float32))
+                        continue
+                    self._gpu_match_template.upload(np.ascontiguousarray(template))
+                    scores = self._gpu_matcher.match(self._gpu_match_roi, self._gpu_match_template).download()
+                    np.nan_to_num(scores, copy=False, nan=0, posinf=0, neginf=0)
+                    maps.append(scores)
+                self.template_backend = 'cuda'
+                return maps
+            except (cv2.error, AttributeError, RuntimeError) as e:
+                self.template_backend_error = str(e)
+                self._gpu_matcher = False
+                if backend == 'cuda':
+                    raise RuntimeError(f'CUDA 模板匹配失败：{e}') from e
+        fh = cv2.getOptimalDFTSize(((h + 63) // 64) * 64)
+        fw = cv2.getOptimalDFTSize(((w + 63) // 64) * 64)
+        buf = np.zeros((fh, fw), np.float32)
+        buf[:h, :w] = roi
+        spectrum = cv2.dft(buf, flags=cv2.DFT_COMPLEX_OUTPUT)
+        sums, squares = cv2.integral2(roi, sdepth=cv2.CV_64F, sqdepth=cv2.CV_64F)
+        denominators = {}
+        maps = []
+        for template in templates:
+            th, tw = template.shape
+            key = (fh, fw, template.shape, template.dtype.str, template.tobytes())
+            cached = self._match_cache.get(key)
+            if cached is None:
+                centered = template.astype(np.float32) - float(np.mean(template))
+                norm = float(np.linalg.norm(centered))
+                buf.fill(0)
+                buf[:th, :tw] = centered
+                kernel = cv2.dft(buf, flags=cv2.DFT_COMPLEX_OUTPUT)
+                capacity = min(16, max(0, self.P.search.fft_cache_mb / 2)) * 1024 ** 2
+                while self._match_cache and self._match_cache_bytes + kernel.nbytes > capacity:
+                    _, (_, old) = self._match_cache.popitem(last=False)
+                    self._match_cache_bytes -= old.nbytes
+                if kernel.nbytes <= capacity:
+                    self._match_cache[key] = (norm, kernel)
+                    self._match_cache_bytes += kernel.nbytes
+            else:
+                norm, kernel = cached
+                self._match_cache.move_to_end(key)
+            shape = (th, tw)
+            if shape not in denominators:
+                count = th * tw
+                total = sums[th:, tw:] - sums[:-th, tw:] - sums[th:, :-tw] + sums[:-th, :-tw]
+                sq = squares[th:, tw:] - squares[:-th, tw:] - squares[th:, :-tw] + squares[:-th, :-tw]
+                denominators[shape] = np.sqrt(np.maximum(sq - total * total / count, 0))
+            if norm < 1e-6:
+                maps.append(np.ones((h - th + 1, w - tw + 1), np.float32))
+                continue
+            cross = cv2.idft(cv2.mulSpectrums(spectrum, kernel, 0, conjB=True),
+                            flags=cv2.DFT_SCALE | cv2.DFT_REAL_OUTPUT)[:h - th + 1, :w - tw + 1]
+            den = denominators[shape] * norm
+            scores = np.zeros_like(cross)
+            np.divide(cross, den, out=scores, where=den > 1e-6)
+            np.clip(scores, -1, 1, out=scores)
+            maps.append(scores)
+        return maps
 
     def _recovery_identity(self, fr, m):
         if not self.references:
@@ -417,12 +595,13 @@ class RingTracker:
         roi = fr.u8('gray')[y0:y1, x0:x1]
         if scale < 1:
             roi = cv2.resize(roi, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-        peaks = []
+        peaks, patches, sizes = [], [], []
         for memory, angle in memories:
             template = memory['image']
             if abs(angle) > 0.5:
                 n = template.shape[0]
-                A = cv2.getRotationMatrix2D(((n - 1) / 2, (n - 1) / 2), -angle, 1)
+                # 搜索模板按整度缓存；最终身份分和圆心测量仍使用当前原图。
+                A = cv2.getRotationMatrix2D(((n - 1) / 2, (n - 1) / 2), -round(angle), 1)
                 template = cv2.warpAffine(template, A, (n, n), borderMode=cv2.BORDER_REFLECT_101)
             size = memory['size'] * r / memory['r']
             for ratio in (1.0, 0.9, 1.1):
@@ -430,15 +609,18 @@ class RingTracker:
                 if n > min(roi.shape):
                     continue
                 patch = cv2.resize(template, (n, n), interpolation=cv2.INTER_LINEAR)
-                scores = cv2.matchTemplate(roi, patch, cv2.TM_CCOEFF_NORMED)
-                for _ in range(2):
-                    _, score, _, point = cv2.minMaxLoc(scores)
-                    if score < TP.template_score:
-                        break
-                    x = x0 + (point[0] + n / 2) / scale - 0.5
-                    y = y0 + (point[1] + n / 2) / scale - 0.5
-                    peaks.append((score, x, y, r * ratio))
-                    cv2.circle(scores, point, max(3, int(round(r * scale))), -1, -1)
+                patches.append(patch)
+                sizes.append((n, ratio))
+        score_maps = self._match_templates(roi, patches)
+        for scores, (n, ratio) in zip(score_maps, sizes):
+            for _ in range(2):
+                _, score, _, point = cv2.minMaxLoc(scores)
+                if score < TP.template_score:
+                    break
+                x = x0 + (point[0] + n / 2) / scale - 0.5
+                y = y0 + (point[1] + n / 2) / scale - 0.5
+                peaks.append((score, x, y, r * ratio))
+                cv2.circle(scores, point, max(3, int(round(r * scale))), -1, -1)
         checked, valid = [], []
         min_sectors = max(V.track_sectors, 12 if self.phase == REACQUIRE else 10)
         for score, x, y, radius in sorted(peaks, reverse=True):
@@ -576,7 +758,7 @@ class RingTracker:
     def _step_search(self, fr, T, stamp):
         P, V, TP = self.P, self.P.verify, self.P.track
         S = P.search
-        deadline = time.perf_counter() + S.budget_ms / 1000
+        deadline = min(self._deadline, time.perf_counter() + S.budget_ms / 1000)
         if self.phase == REACQUIRE:
             m = self._template_measure(fr, stamp)
             if self.ambiguous:
@@ -587,6 +769,8 @@ class RingTracker:
                     self._accept_recovery(m, stamp)
                 return
             self.recovery_candidate = None
+        if time.perf_counter() >= deadline:
+            return
         H, W = fr.shape
         self._stamp = stamp
         region, r_lo, r_hi, ref, ref_r = self._region(W, H)
@@ -597,10 +781,13 @@ class RingTracker:
             self.pending = []
             return
         any_pass = False
+        ready_ed = self._poll_ed(stamp)
+        ed_idle = self._ed_future is None or self._ed_future.done()
 
         # 1. 已有候选：搬运后在当前帧复核；还没有 EDCircles 支持的，每帧再试一次候选级放大检测
-        for c in self.cands:
-            if time.perf_counter() >= deadline:
+        confirm_end = (time.perf_counter() + deadline) * 0.5
+        for c in sorted(self.cands, key=lambda c: (self.phase == SEARCH and c.ed_hits == 0, -sum(c.hits))):
+            if time.perf_counter() >= confirm_end:
                 break
             d = _delta(V.delta_search if T is None else V.delta_track, c.r)
             m = measure_channels(fr, self.cam, c.cx, c.cy, c.r, V, 'lock', d,
@@ -617,11 +804,11 @@ class RingTracker:
             if m.ok:
                 c.cx, c.cy, c.r, c.meas, c.last_pass = m.cx, m.cy, m.r, m, stamp
                 any_pass = True
-                if c.ed_hits == 0 and ed_support(fr, m, S, V):
+                if c.ed_hits == 0 and ed_idle and ed_support(fr, m, S, V):
                     c.ed_hits = 1
 
         # 候选生成和复核共用预算；未复核的候选搬运到下一帧继续。
-        found = self.pending
+        found = self.pending + ready_ed
         waiting = {id(f) for f in found}
         self.pending = []
         ed_chans = fr.channels(V.channels)
@@ -641,16 +828,29 @@ class RingTracker:
                                                    max(0, j.valid[1] * 2 ** j.level - ref[1],
                                                        ref[1] - j.valid[3] * 2 ** j.level)),
                                         j.radii[0] * 2 ** j.level))
+        active_mf, active_cursor = mf_jobs, self.cursor
+        # 小环在点击附近高频复查，其余帧继续完整范围轮询。
+        focused = clicked and self.n_frames % 2 == 0 and r_lo < S.click_focus_r_max
+        if focused and S.use_matched_filter:
+            side = S.click_tile
+            focus = (max(region[0], ref[0] - side), max(region[1], ref[1] - side),
+                     min(region[2], ref[0] + side), min(region[3], ref[1] + side))
+            active_mf = self.searcher.plan(focus, (W, H), r_lo, min(r_hi, S.click_focus_r_max), S.click_tile + 64)
+            active_cursor = self.focus_cursor
         n_ed = n_mf = 0
+        ed_request = None
         # 两种候选生成交替优先，预留剩余预算做原图复核。
         generation_end = t0 + max(0.0, deadline - t0) * 0.5
         mf_first = not clicked or self.n_frames % 2 == 0
-        if clicked and mf_first and mf_jobs and time.perf_counter() < generation_end:
-            ch = ed_chans[(self.cursor // len(mf_jobs)) % len(ed_chans)]
-            job = mf_jobs[self.cursor % len(mf_jobs)]
+        if clicked and mf_first and active_mf and time.perf_counter() < generation_end:
+            ch = ed_chans[(active_cursor // len(active_mf)) % len(ed_chans)]
+            job = active_mf[active_cursor % len(active_mf)]
             pyr = build_pyramid(fr.f32(ch), job.level)
             found += self.searcher.run(pyr, job)
-            self.cursor += 1
+            if focused:
+                self.focus_cursor += 1
+            else:
+                self.cursor += 1
             n_mf += 1
         while n_ed < len(ed_jobs) and time.perf_counter() < (generation_end if clicked else deadline):
             sweep = self.ed_cursor // len(ed_jobs)
@@ -659,16 +859,25 @@ class RingTracker:
             zoom = 1.0
             if clicked and (sweep // len(ed_chans)) % 2 == 0:
                 zoom = min(2.0, S.ed_local_max_zoom, max(1.0, S.ed_local_target_r / preferred_r))
-            found += run_ed(fr.u8(ch), ed_jobs[self.ed_cursor % len(ed_jobs)], r_lo, r_hi, S, zoom)
-            self.ed_cursor += 1
-            n_ed += 1
+            job = ed_jobs[self.ed_cursor % len(ed_jobs)]
+            if S.async_ed:
+                if self._ed_future is None:
+                    ed_request = (fr, job, ch, r_lo, r_hi, zoom, stamp)
+                break
+            else:
+                found += run_ed(fr.u8(ch), job, r_lo, r_hi, S, zoom)
+                self.ed_cursor += 1
+                n_ed += 1
             if mf_jobs or (time.perf_counter() - t0) * 1000 >= S.budget_ms:
                 break
-        if clicked and not mf_first and mf_jobs and time.perf_counter() < generation_end:
-            ch = ed_chans[(self.cursor // len(mf_jobs)) % len(ed_chans)]
-            job = mf_jobs[self.cursor % len(mf_jobs)]
+        if clicked and not mf_first and active_mf and time.perf_counter() < generation_end:
+            ch = ed_chans[(active_cursor // len(active_mf)) % len(ed_chans)]
+            job = active_mf[active_cursor % len(active_mf)]
             found += self.searcher.run(build_pyramid(fr.f32(ch), job.level), job)
-            self.cursor += 1
+            if focused:
+                self.focus_cursor += 1
+            else:
+                self.cursor += 1
             n_mf += 1
         if not clicked and mf_jobs and time.perf_counter() < deadline:
             pyr = build_pyramid(fr.f32('gray'), max(j.level for j in mf_jobs))
@@ -684,12 +893,14 @@ class RingTracker:
         found = [f for f in found if region[0] <= f.x < region[2] and region[1] <= f.y < region[3]
                  and r_lo / 1.15 <= f.r <= r_hi * 1.15]
         if ref is not None:
-            found.sort(key=lambda f: (id(f) not in waiting, f.score < ED_SCORE,
+            found.sort(key=lambda f: ((int(math.hypot(f.x - ref[0], f.y - ref[1]) /
+                                          max(32, S.click_tile / 2)) if clicked else 0),
+                                      -f.score, id(f) not in waiting,
                                       math.hypot(f.x - ref[0], f.y - ref[1])))
         self.dbg['found'] = [(f.x, f.y, f.r) for f in found]
         n_ver = 0
         for index, f in enumerate(found):
-            if n_ver >= TP.max_verify or (n_ver and time.perf_counter() >= deadline):
+            if n_ver >= TP.max_verify or time.perf_counter() >= deadline:
                 self.pending = found[index:][:TP.max_verify * 2]
                 break
             same = [c for c in self.cands if self._same(c, f.x, f.y, f.r)]
@@ -709,7 +920,8 @@ class RingTracker:
                 continue
             if any(self._same(c, m.cx, m.cy, m.r) for c in self.cands):
                 continue
-            m.ed_ok = ed_support(fr, m, S, V)
+            idle = self._ed_future is None or self._ed_future.done()
+            m.ed_ok = m.source == 'ed' or (idle and ed_support(fr, m, S, V))
             candidate = _Cand(m, stamp, max(TP.confirm_window, TP.reacq_weak_hits) if self.references else TP.confirm_window)
             candidate.needed = (TP.reacq_confirm_hits if m.identity_score >= TP.identity_score else TP.reacq_weak_hits) if self.references else TP.confirm_hits
             candidate.frame = self.n_frames
@@ -765,6 +977,14 @@ class RingTracker:
             self._remember(fr, win.meas)
         elif len(q) >= 2:
             self.ambiguous = True
+        # 首次确认优先使用局部 ED，避免后台区域搜索持续占用检测器。
+        pending_confirmation = any(c.ed_hits == 0 and (
+            stamp - c.created < TP.cand_timeout_s + TP.coast_s or self.n_frames % 4 != 0)
+            for c in self.cands)
+        if self.phase in (SEARCH, REACQUIRE) and ed_request is not None and not pending_confirmation:
+            if self._submit_ed(*ed_request):
+                self.ed_cursor += 1
+                self.dbg['jobs']['ed'] = (1, len(ed_jobs))
 
     def _choose(self, q, ref, ref_r):
         TP = self.P.track

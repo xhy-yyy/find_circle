@@ -7,8 +7,8 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
-# ED_Lib 只用到 core 和 imgproc，不需要 opencv_contrib
-find_package(OpenCV REQUIRED COMPONENTS core imgproc)
+# CUDA 由 Python OpenCV 按需调用，CPU 光流复用 video 模块的金字塔。
+find_package(OpenCV REQUIRED COMPONENTS core imgproc video)
 
 set(EDLIB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ED_Lib)
 add_library(edcircles SHARED

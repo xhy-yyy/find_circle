@@ -38,6 +38,7 @@ def run_click(img, click, P, n, seed):
     """返回 (锁上的圆心 or None, 帧号)。"""
     H, W = img.shape[:2]
     trk = RingTracker(P, Camera.default(W, H))
+    trk.warmup()
     trk.set_click(*click)
     rng = np.random.default_rng(seed)
     base = img.astype(np.int16)
@@ -45,7 +46,9 @@ def run_click(img, click, P, n, seed):
         f = np.clip(base + rng.integers(-2, 3, base.shape), 0, 255).astype(np.uint8)
         res = trk.process(f, i / 30.0, i)
         if res.state == 'DETECTED':
+            trk.close()
             return res.center_px, i
+    trk.close()
     return None, n
 
 

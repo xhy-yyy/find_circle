@@ -11,7 +11,7 @@ CALIB="${CALIB:-}"                     # 相机标定 yaml（ROS camera_info 格
 EXPOSURE="${EXPOSURE:-keep}"           # keep = 保持相机控制项；auto = 自动曝光；数字单位 100 us
 UDP_OUT="${UDP_OUT:-}"                 # 结果发到哪里，如 192.168.1.10:9000；空 = 打印到屏幕
 LISTEN="${LISTEN:-9001}"               # 接收点击/高度/重置的端口
-REC_DIR="${REC_DIR:-$HOME/find_circle_rec}"   # 机载运行时录像和结果日志的目录；空 = 不录
+REC_DIR="${REC_DIR-$HOME/find_circle_rec}"   # 机载运行时录像和结果日志的目录；空 = 不录
 TARGET="${TARGET:-127.0.0.1}"          # click/height/reset 命令发往的视觉机地址
 PARAMS="${PARAMS:-}"                   # 调参 yaml；空 = 默认参数
 TEST_IMAGES="${TEST_IMAGES:-$HOME/桌面/无人机下视圆环图片}"
@@ -204,6 +204,7 @@ PYEOF
 }
 
 cmd_clean() {
+  [[ -n "$REC_DIR" ]] || die "REC_DIR 为空，没有指定录像清理目录"
   "$PY" - "$REC_DIR" "$@" <<'PYEOF'
 import argparse
 from pathlib import Path

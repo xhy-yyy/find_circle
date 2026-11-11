@@ -36,8 +36,12 @@ def main():
     ap.add_argument('--max-frames', type=int, default=0)
     ap.add_argument('--show', action='store_true')
     ap.add_argument('--params')
+    ap.add_argument('--threads', type=int, default=4)
     ap.add_argument('--set', action='append', default=[])
     a = ap.parse_args()
+    if a.threads < 1:
+        ap.error('threads 必须大于 0')
+    cv2.setNumThreads(a.threads)
 
     cap = cv2.VideoCapture(a.video)
     if not cap.isOpened():
@@ -49,6 +53,7 @@ def main():
     P = Params.load(a.params, a.set)
     cam = Camera.from_yaml(a.calib, (W, H)) if a.calib else Camera.default(W, H, a.fx)
     trk = RingTracker(P, cam)
+    trk.warmup()
     if a.height:
         trk.set_height(a.height)
     click = None
@@ -116,6 +121,7 @@ def main():
             if k == ord('r'):
                 trk.reset()
     writer.release()
+    trk.close()
     if jf:
         jf.close()
     n = sum(counts.values())

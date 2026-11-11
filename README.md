@@ -24,8 +24,8 @@
 | 复核 | 64～128 条射线找"两侧都比它暗"的亮峰，RANSAC 拟圆，圆不够时拟椭圆（斜视）；看 16 个扇区的覆盖、最大缺口、内点率、残差。先在灰度上复核，不通过再在白度通道上复核 |
 | EDCircles 支持 | 全图检出；或在复核通过的候选周围取一小块、放大到半径约 24 px 后再跑 EDCircles，圆心半径吻合就算 |
 | 首锁 | 扇区 ≥ 14/16、缺口 ≤ 2、内点 ≥ 85%；5 帧中 3 帧通过；有 EDCircles 支持 |
-| 帧间预测 | 金字塔 LK 光流 + RANSAC 相似变换，点击和锁定后均优先目标附近特征；光流失效时短时使用在线学习的平移、尺度变化率 |
-| 局部找回 | 工作模板、近期可靠参考和首锁参考按预测缩放、旋转后做归一化互相关；复核几何、身份和弱候选的历史线宽比例，再做多帧确认；同帧不重复搜索 |
+| 帧间预测 | 复用通过前后向检查的角点，按覆盖情况补点；局部裁块提角点，CPU 前后向 LK 共用金字塔，CUDA 可用时使用 GPU 角点和光流；保留 RANSAC 及运动失效回退 |
+| 局部找回 | 工作模板、近期可靠参考和首锁参考按预测缩放、旋转后做归一化互相关，共享图像 FFT 与积分图；保留多峰歧义、几何和身份验证，再做多帧确认 |
 
 白度通道是 min(B, G, R)。石灰三个颜色分量都高，取最小值后几乎不变暗；黄沙、红土、草地至少有一个分量低，取最小值后明显变暗，环更突出。黄沙测试图上，环的对比从灰度的 6.4 提高到 11.0。
 
@@ -73,6 +73,25 @@ CALIB=cam.yaml UDP_OUT=地面站IP:9000 LISTEN=9001 ./run.sh camera
 ```
 
 默认保持摄像头原有曝光和对焦设置。曾设置手动曝光、需要恢复自动时，运行 `EXPOSURE=auto ./run.sh camera`。户外需要限制运动拖影时，可用 `EXPOSURE=20 ./run.sh camera` 显式设置 2 ms 手动曝光，并根据画面亮度调试。数字曝光值的单位是 100 µs；控件名称以 `v4l2-ctl -l` 为准。
+
+Jetson Orin Nano 更新代码后先运行 `./build.sh`，在板端编译 CPU 金字塔复用和椭圆假设验证函数。Python OpenCV 与 C++ OpenCV 应使用同一套安装，不能复制电脑上的 `.so` 到板端。CUDA 需要 OpenCV 实际编译相应模块，仅安装 CUDA 驱动不会自动启用这些接口。
+
+```bash
+SHOW=1 ./run.sh camera --threads 4 --set motion.backend=auto --stats --quiet
+./run.sh camera --set motion.backend=cuda       # 要求 CUDA；不可用时明确报错
+./run.sh camera --set motion.backend=cpu        # 只用 CPU
+REC_DIR="" ./run.sh camera                      # 关闭录像和文件日志
+```
+
+香橙派使用相同代码，在板端重新编译后运行 `SHOW=1 ./run.sh camera --threads 4 --set motion.backend=cpu --set track.template_backend=cpu --stats --quiet`。RK3588 的 GPU 不使用 CUDA，当前走 CPU 加速路径。两块板都保留摄像头原有曝光设置；对比性能时保持分辨率、录像、预览配置一致，可分别比较 `--threads 2` 和 `--threads 4`。
+
+`auto` 默认尝试 CUDA，设备或接口不可用时回退 CPU；启动时打印运动估计和重捕匹配的实际后端。较大的重捕图块支持 CUDA 归一化互相关，缺少模块时回退 CPU 的共享 FFT 路径；`--set track.template_backend=cpu` 可单独关闭 GPU 匹配。区域 ED 搜索默认在单个后台线程执行，候选经有效运动链补偿后仍须在当前原图复核；运动链失效、超过 0.25 s 或重新点击时丢弃。处理帧采用 28 ms 软预算，完整重捕验证和单次几何复核仍可能超时，这不是已验证的板端 30 FPS 保证。
+
+相机录像使用有界后台队列，不阻塞识别；安装 `ffmpeg` 且相机后端支持原始 MJPEG 时直接保存压缩码流，否则后台编码。`--record-mode encode` 可固定使用编码路径，结束时显示写入与丢弃帧数。预览默认 15 FPS，识别仍逐帧处理；可用 `--display-fps 30` 提高预览刷新率。启动会预热常用滤波核和 CUDA 接口。
+
+`--stats` 每秒报告实际处理的新帧 FPS、漏处理帧数、算法 P95 和帧龄；它们与录像文件头的 FPS 不同。输入为 30 FPS 时，新帧输出上限为 30 FPS；要实测超过 30 FPS，先确认摄像头支持并实际输出更高帧率。检查性能时应开启与实用场景相同的录像、预览配置。
+
+`--quiet` 仅隐藏逐帧终端 JSON，UDP 和文件日志仍正常输出。
 
 `--listen` 端口收 JSON：
 
@@ -124,12 +143,19 @@ verify:
 | --- | --- | --- |
 | `search.click_box` | 600 | 点击框边长（px）。点击误差大就加大 |
 | `search.click_r_min` / `search.click_tile` | 4 / 192 | 无高度输入时的点击搜索半径下限、点击搜索分块大小（px） |
+| `search.click_focus_r_max` | 12 | 点击附近高频复查的小环半径上限（px），完整范围仍交替轮询 |
 | `search.click_max_levels` | 1 | 点击框最多扩大几级；0 = 只在初始框里找 |
+| `search.async_ed` | true | 后台生成区域 ED 候选；false 使用同步搜索 |
+| `search.fft_cache_mb` | 64 | 核频谱缓存上限（MiB），避免高度变化导致无限增长 |
+| `motion.backend` | auto | auto / cpu / cuda，auto 在 CUDA 不可用时回退 CPU |
+| `motion.refresh_frames` | 8 | 定期刷新角点；数量或局部覆盖不足时提前刷新 |
+| `track.frame_budget_ms` | 28 | 含光流和预处理的整帧软预算（ms） |
 | `verify.lock_sectors` | 14 | 首锁扇区下限（满 16）。漏检多可降到 13，误检会增加 |
 | `track.confirm_hits` | 3 | 5 帧里几帧通过才首锁 |
 | `track.coast_s` | 0.3 | 测不到时最多预测多久 |
 | `track.reacq_box_min` | 240 | 小圆环的重捕搜索框最小边长（原图 px） |
 | `track.template_score` | 0.65 | 局部外观匹配阈值；通过后仍须圆环几何复核 |
+| `track.template_backend` | auto | auto / cpu / cuda，auto 对较大重捕图块优先使用可用的 CUDA 模板匹配 |
 | `track.identity_score` | 0.80 | 重捕身份分；较弱结果须达到 `template_score - 0.15`，通过首锁几何门限并延长确认 |
 | `track.identity_margin` | 0.06 | 两个重捕候选的身份分差不足时暂不接回 |
 | `track.reacq_confirm_hits` / `track.reacq_weak_hits` | 3 / 5 | 重捕的连续确认帧数，分别用于身份明确和较弱的结果 |

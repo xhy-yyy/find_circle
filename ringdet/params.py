@@ -44,7 +44,7 @@ class SearchParams:
     ed_min_path: int = 10
     ed_validate: bool = False    # True = 先用 EDPF 筛边缘段（ED_Lib 默认），会删掉高空细环的弱边缘
     ed_min_axis_ratio: float = 0.6   # 椭圆短轴/长轴低于它不要（下视倾斜 30° 时约 0.87）
-    ed_cell: int = 640           # 分格边长（原图 px），每帧至少处理一格
+    ed_cell: int = 640           # 区域 ED 的分格边长（原图 px）
     # 候选级 EDCircles：复核通过的候选，在它周围的小块上放大后再跑一次 EDCircles（高空细环全图跑连不成圆）
     ed_local: bool = True
     ed_local_target_r: float = 24.0    # 放大到半径约这么大
@@ -61,6 +61,9 @@ class SearchParams:
     escalate_s: float = 3.0      # 框内这么久没有候选通过复核就扩大一级
     click_max_levels: int = 1    # 最多扩大几级（每级边长 x2）；0 = 只在初始框里找
     click_only: bool = True      # True：没点击就不搜索（输出 LOST）；False：没点击时全图搜索
+    fft_cache_mb: float = 64.0    # 核频谱缓存上限
+    async_ed: bool = True        # 区域 ED 在单个后台线程执行，结果在当前帧重新验证
+    click_focus_r_max: float = 12.0  # 点击附近高频复查的小环半径上限
 
 
 @dataclass
@@ -113,6 +116,8 @@ class MotionParams:
     min_inliers: int = 50
     grid: int = 4                # 内点覆盖检查：grid x grid 格子里至少 min_cells 格有内点
     min_cells: int = 4
+    backend: str = 'auto'        # auto / cpu / cuda；auto 在 CUDA 不可用时回退 CPU
+    refresh_frames: int = 8      # 角点定期补充，数量或局部覆盖不足时提前补充
 
 
 @dataclass
@@ -143,6 +148,8 @@ class TrackParams:
     reacq_weak_hits: int = 5
     template_update_hits: int = 8  # 重捕后通过稳定测量才更新身份参考
     learn_rate: float = 0.15     # 可靠测量的工作模板、形状和运动统计更新率
+    frame_budget_ms: float = 28.0  # 包含预处理和光流的整帧软预算
+    template_backend: str = 'auto'  # auto / cpu / cuda；CUDA 用于较大的重捕图块
 
 
 @dataclass

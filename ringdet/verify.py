@@ -6,11 +6,14 @@
 from __future__ import annotations
 
 import math
+from functools import lru_cache
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
 import numpy as np
 import cv2
+
+from .edcircles import ellipse_hypotheses
 
 
 @dataclass
@@ -54,6 +57,12 @@ def _bg_len(w):
     return max(2.0, 0.5 * w)
 
 
+@lru_cache(maxsize=8)
+def _angles(n):
+    th = np.arange(n) * (2 * math.pi / n)
+    return th, np.cos(th), np.sin(th)
+
+
 def _ray_scores(gray, cx, cy, r, delta, n_rays, V, r_ray=None):
     """沿射线采样并对每档线宽打分。
 
@@ -64,8 +73,7 @@ def _ray_scores(gray, cx, cy, r, delta, n_rays, V, r_ray=None):
     H, W = gray.shape
     widths = _widths(r, V.width_ratio)
     step = V.step
-    th = np.arange(n_rays) * (2 * math.pi / n_rays)
-    ct, st = np.cos(th), np.sin(th)
+    th, ct, st = _angles(n_rays)
     rr = np.full(n_rays, float(r)) if r_ray is None else np.asarray(r_ray, np.float64)
     ext = max(w / 2 + V.gap + _bg_len(w) for w in widths) + 2 * step
     lo = max(-(rr.min() - 0.5), -delta - ext)
@@ -297,8 +305,11 @@ def _ellipse_pass(gray, cam, m0, noise, V, rng):
         tau = max(V.inlier_tol[0], V.inlier_tol[1] * m0.r)
         best_inl, best_e = None, None
         n = len(pu)
-        for _ in range(60):
-            idx = rng.choice(n, 5, replace=False)
+        samples = np.array([rng.choice(n, 5, replace=False) for _ in range(60)], np.int32)
+        native = ellipse_hypotheses(pu, samples, m0.r, tau, V.ellipse_min_axis_ratio)
+        if native is not None:
+            best_e, best_inl = native
+        for idx in samples if native is None else ():
             try:
                 (ex, ey), (d1, d2), ang = cv2.fitEllipseDirect(pu[idx].astype(np.float32))
             except cv2.error:

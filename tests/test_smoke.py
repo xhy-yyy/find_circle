@@ -2,6 +2,9 @@
 import math
 import os
 import sys
+import shutil
+import threading
+from concurrent.futures import Future
 
 import numpy as np
 import cv2
@@ -350,3 +353,182 @@ def test_protected_memory_recovers_when_working_template_is_unusable(monkeypatch
     assert result.target_id == 1
     assert math.dist(result.center_px, (390, 180)) < 1.5
     np.testing.assert_array_equal(tracker.references[0]['image'], reference)
+
+
+def test_shared_fft_ncc_matches_opencv():
+    rng = np.random.default_rng(61)
+    roi = rng.integers(0, 256, (240, 260), dtype=np.uint8)
+    templates = [roi[40:40+n, 55:55+n].copy() for n in (19, 27, 35)]
+    params = Params()
+    params.track.template_backend = 'cpu'
+    for template, scores in zip(templates, RingTracker(params)._match_templates(roi, templates)):
+        expected = cv2.matchTemplate(roi, template, cv2.TM_CCOEFF_NORMED)
+        np.testing.assert_allclose(scores, expected, atol=2e-4)
+        assert cv2.minMaxLoc(scores)[3] == (55, 40)
+
+
+def test_first_confirmation_is_not_starved_by_regional_ed(monkeypatch):
+    import ringdet.tracker as module
+    rng = np.random.default_rng(65)
+    image = synth.ground_texture(240, 360, rng, amp=8)
+    synth.draw_ring(image, 180, 120, 6, 1.2, 95)
+    image = synth.degrade(image, rng, blur=.5, noise=1)
+    tracker = RingTracker(Params(), Camera.default(360, 240))
+    tracker.warmup()
+    tracker.set_click(180, 120)
+    monkeypatch.setattr(module, 'ed_support', lambda *_: tracker.n_frames >= 7)
+    def occupied(*_):
+        tracker._ed_future = Future()
+        tracker._ed_meta = dict(valid=True, stamp=0., A=np.eye(3))
+        return True
+    monkeypatch.setattr(tracker, '_submit_ed', occupied)
+    try:
+        for i in range(8):
+            result = tracker.process(image, i / 30, i)
+            if result.state == 'DETECTED':
+                break
+        assert result.state == 'DETECTED' and result.frame_id <= 7
+    finally:
+        tracker.close()
+
+
+@pytest.mark.parametrize('invalidate', [None, 'motion', 'click', 'age'])
+def test_async_ed_candidates_require_valid_current_coordinates(invalidate):
+    from ringdet.motion import Motion
+    from ringdet.search import Candidate
+    tracker = RingTracker()
+    tracker.dbg = {}
+    future = Future()
+    tracker._ed_future = future
+    tracker._ed_meta = dict(valid=True, stamp=1.0,
+                           A=np.array([[1., 0, 100], [0, 1., 200], [0, 0, 1.]]))
+    tracker._propagate(Motion(np.array([[1.1, 0, 5], [0, 1.1, -2.]]), 80))
+    if invalidate == 'motion':
+        tracker._propagate(None)
+    elif invalidate == 'click':
+        tracker.set_click(120, 120)
+        tracker._apply_click(1.03)
+    future.set_result([Candidate(10, 12, 6, 100, -1)])
+    found = tracker._poll_ed(1.4 if invalidate == 'age' else 1.03)
+    if invalidate:
+        assert not found
+    else:
+        assert len(found) == 1
+        np.testing.assert_allclose((found[0].x, found[0].y, found[0].r), (126, 231.2, 6.6))
+
+
+def test_cpu_native_flow_matches_opencv():
+    rng = np.random.default_rng(62)
+    prev = np.clip(synth.ground_texture(180, 320, rng), 0, 255).astype(np.uint8)
+    current = cv2.warpAffine(prev, np.float32([[1, 0, 7], [0, 1, -3]]), (320, 180))
+    points = cv2.goodFeaturesToTrack(prev, 80, .01, 10)
+    native = edcircles.flow_fb(prev, current, points)
+    assert native is not None, '先运行 ./build.sh'
+    expected, status, _ = cv2.calcOpticalFlowPyrLK(prev, current, points, None,
+        winSize=(21, 21), maxLevel=3, criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, .01))
+    np.testing.assert_array_equal(native[1], status.ravel())
+    np.testing.assert_allclose(native[0][status.ravel() != 0], expected[status.ravel() != 0], atol=1e-4)
+
+
+def test_native_ellipse_preserves_measurement(monkeypatch):
+    from ringdet import verify
+    rng = np.random.default_rng(63)
+    image = synth.ground_texture(240, 360, rng, amp=8)
+    synth.draw_ring(image, 180, 120, 20, 2, 85, axes=(24, 16), angle_deg=28)
+    image = synth.degrade(image, rng, blur=.5, noise=1)
+    args = (image.astype(np.float32), Camera.default(360, 240), 180, 120, 20, 2, Params().verify)
+    accelerated = verify.measure(*args)
+    monkeypatch.setattr(verify, 'ellipse_hypotheses', lambda *_: None)
+    reference = verify.measure(*args)
+    assert accelerated.ok and reference.ok and accelerated.ellipse is not None
+    np.testing.assert_allclose(accelerated.ellipse, reference.ellipse, atol=1e-4)
+    assert accelerated.sectors == reference.sectors
+
+
+def test_cuda_auto_falls_back_without_device(monkeypatch):
+    from ringdet.motion import GroundMotion
+    monkeypatch.setattr(cv2.cuda, 'getCudaEnabledDeviceCount', lambda: 0)
+    assert GroundMotion(Params().motion).backend == 'cpu'
+    params = Params()
+    params.motion.backend = 'cuda'
+    with pytest.raises(RuntimeError, match='CUDA'):
+        GroundMotion(params.motion)
+
+
+@pytest.mark.skipif(cv2.cuda.getCudaEnabledDeviceCount() == 0 or not (
+    hasattr(cv2, 'cuda_SparsePyrLKOpticalFlow') or hasattr(cv2.cuda, 'SparsePyrLKOpticalFlow_create')),
+    reason='需要 CUDA 设备和 OpenCV cudaoptflow 模块')
+def test_cuda_motion_tracks_translation():
+    from ringdet.motion import GroundMotion
+    rng = np.random.default_rng(64)
+    image = np.clip(synth.ground_texture(360, 640, rng), 0, 255).astype(np.uint8)
+    params = Params()
+    params.motion.backend = 'cuda'
+    motion = GroundMotion(params.motion)
+    motion.focus = (320, 180, 15)
+    motion.update(image)
+    shifted = cv2.warpAffine(image, np.float32([[1, 0, 9], [0, 1, -4]]), (640, 360))
+    transform = motion.update(shifted)
+    assert motion.backend == 'cuda' and transform is not None
+    assert math.dist(transform.apply(320, 180), (329, 176)) < 1
+
+
+@pytest.mark.skipif(cv2.cuda.getCudaEnabledDeviceCount() == 0 or not hasattr(cv2.cuda, 'createTemplateMatching'),
+    reason='需要 CUDA 设备和 OpenCV CUDA 模板匹配模块')
+def test_cuda_ncc_matches_cpu():
+    rng = np.random.default_rng(66)
+    roi = rng.integers(0, 256, (180, 240), dtype=np.uint8)
+    template = roi[40:65, 55:80].copy()
+    params = Params()
+    params.motion.backend = 'cpu'
+    params.track.template_backend = 'cuda'
+    tracker = RingTracker(params)
+    scores = tracker._match_templates(roi, [template])[0]
+    assert tracker.template_backend == 'cuda'
+    np.testing.assert_allclose(scores, cv2.matchTemplate(roi, template, cv2.TM_CCOEFF_NORMED), atol=1e-3)
+
+
+def test_record_queue_does_not_block_vision(monkeypatch):
+    from tools.run_camera import AsyncVideoWriter
+    entered, release = threading.Event(), threading.Event()
+    class Writer:
+        def isOpened(self): return True
+        def set(self, *_): pass
+        def write(self, _):
+            entered.set()
+            release.wait(2)
+        def release(self): pass
+    monkeypatch.setattr(cv2, 'VideoWriter', lambda *_: Writer())
+    recorder = AsyncVideoWriter('/unused.avi', 30, (32, 24))
+    try:
+        recorder.submit(np.zeros((24, 32, 3), np.uint8))
+        assert entered.wait(1)
+        for _ in range(6):
+            recorder.submit(np.zeros((24, 32, 3), np.uint8))
+        assert recorder.dropped >= 2
+    finally:
+        release.set()
+        recorder.close()
+    assert not recorder.is_alive()
+
+
+@pytest.mark.skipif(shutil.which('ffmpeg') is None, reason='需要 ffmpeg 才能直存 MJPEG')
+def test_mjpeg_copy_preserves_source_packets(tmp_path):
+    from tools.run_camera import AsyncVideoWriter
+    image = np.full((48, 64, 3), 125, np.uint8)
+    _, packet = cv2.imencode('.jpg', image)
+    path = tmp_path / 'raw.avi'
+    recorder = AsyncVideoWriter(str(path), 30, (64, 48), copy_mjpeg=True)
+    recorder.submit(packet.tobytes())
+    recorder.submit(packet.tobytes())
+    recorder.close()
+    assert recorder.error is None and recorder.written == 2 and recorder.dropped == 0
+    assert packet.tobytes() in path.read_bytes()
+    cap = cv2.VideoCapture(str(path))
+    try:
+        assert int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) == 2
+        ok, decoded = cap.read()
+        assert ok
+        np.testing.assert_array_equal(decoded, cv2.imdecode(packet, cv2.IMREAD_COLOR))
+    finally:
+        cap.release()
