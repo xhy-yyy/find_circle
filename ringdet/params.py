@@ -150,6 +150,10 @@ class TrackParams:
     learn_rate: float = 0.15     # 可靠测量的工作模板、形状和运动统计更新率
     frame_budget_ms: float = 28.0  # 包含预处理和光流的整帧软预算
     template_backend: str = 'auto'  # auto / cpu / cuda；CUDA 用于较大的重捕图块
+    online_learning: bool = True   # 背景感知相关滤波，只产生重捕候选
+    online_min_radius: float = 8.0  # 小于此像素半径保留原像素模板路径
+    online_update_frames: int = 3  # 可靠帧之间的最小滤波器更新间隔
+    online_psr: float = 8.0        # 响应峰相对背景的显著性下限
 
 
 @dataclass

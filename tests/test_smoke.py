@@ -165,6 +165,8 @@ def test_foreign_circle_cannot_replace_trusted_identity(monkeypatch):
     assert result.state == 'DETECTED' and tracker.references
     original = tracker.references[0]['image'].copy()
     adaptive = tracker.template['image'].copy()
+    assert tracker.online is not None
+    online = tracker.online['spectrum'].copy()
     reference_count = len(tracker.references)
     monkeypatch.setattr(tracker.motion, 'update', lambda _: None)
     tracker.process(np.zeros((360, 640), dtype=np.uint8), 11.5 / 30, 12)
@@ -177,6 +179,7 @@ def test_foreign_circle_cannot_replace_trusted_identity(monkeypatch):
         assert result.state != 'DETECTED'
         np.testing.assert_array_equal(tracker.references[0]['image'], original)
         np.testing.assert_array_equal(tracker.template['image'], adaptive)
+        np.testing.assert_array_equal(tracker.online['spectrum'], online)
         assert len(tracker.references) == reference_count
     for i in range(32, 34):
         result = tracker.process(image, i / 30, i)
@@ -356,6 +359,7 @@ def test_click_can_replace_identity_even_near_current_target():
     assert result.click_px is not None
     assert not tracker.references
     assert tracker.learned is None
+    assert tracker.online is None
 
 
 @pytest.mark.parametrize('offset', [(65, -40), (220, 80)])
@@ -375,6 +379,7 @@ def test_click_locks_small_ring_without_descent(offset, height):
     assert result.state == 'DETECTED'
     assert math.dist(result.center_px, (300.3, 190.2)) < 1
     assert abs(result.radius_px - 5.5) < 1
+    assert tracker.online is None
 
 
 @pytest.mark.parametrize('seed', [52, 53, 54])
@@ -432,6 +437,89 @@ def test_protected_memory_recovers_when_working_template_is_unusable(monkeypatch
     assert result.target_id == 1
     assert math.dist(result.center_px, (390, 180)) < 1.5
     np.testing.assert_array_equal(tracker.references[0]['image'], reference)
+
+
+def test_online_recovery_works_without_template_search(monkeypatch):
+    rng = np.random.default_rng(73)
+    image = synth.ground_texture(360, 640, rng, amp=12)
+    synth.draw_ring(image, 320, 180, 18, 2, 75)
+    image = synth.degrade(image, rng)
+    tracker = RingTracker(Params(), Camera.default(640, 360))
+    tracker.set_click(320, 180)
+    try:
+        for i in range(15):
+            result = tracker.process(image, i / 30, i)
+        assert result.state == 'DETECTED' and tracker.online['updates'] >= 2
+        protected = tracker.references[0]['image'].copy()
+        monkeypatch.setattr(tracker.motion, 'update', lambda _: None)
+        def unavailable(*_):
+            pytest.fail('高置信度在线候选不应重复做模板搜索')
+        monkeypatch.setattr(tracker, '_match_templates', unavailable)
+        shifted = cv2.warpAffine(image, np.float32([[1, 0, 70], [0, 1, 0]]), (640, 360))
+        for i in range(15, 18):
+            result = tracker.process(shifted, i / 30, i)
+            assert (result.state == 'DETECTED') == (i == 17)
+        assert result.target_id == 1 and result.debug['recovery_source'] == 'online'
+        assert math.dist(result.center_px, (390, 180)) < 1.5
+        np.testing.assert_array_equal(tracker.references[0]['image'], protected)
+    finally:
+        tracker.close()
+
+
+def test_online_candidates_adapt_to_scale_and_rotation():
+    from ringdet.motion import Motion
+    from ringdet.frame import Frame
+    rng = np.random.default_rng(74)
+    image = synth.ground_texture(360, 640, rng, amp=12)
+    synth.draw_ring(image, 320, 180, 18, 2, 75)
+    cv2.circle(image, (365, 180), 14, 200, -1)
+    image = synth.degrade(image, rng)
+    tracker = RingTracker(Params(), Camera.default(640, 360))
+    tracker.set_click(320, 180)
+    try:
+        for i in range(18):
+            result = tracker.process(image, i / 30, i)
+        assert result.state == 'DETECTED' and tracker.online is not None
+        A = cv2.getRotationMatrix2D((320, 180), 12, 1.25)
+        A[:, 2] += (45, -12)
+        moved = cv2.warpAffine(image, A, (640, 360))
+        tracker._propagate(Motion(A, 80))
+        tracker.dbg = {}
+        peaks = tracker._online_peaks(Frame(moved, 2), *tracker.tgt, 150)
+        assert peaks and tracker.dbg['online_psr'] >= tracker.P.track.online_psr
+        assert math.dist(peaks[0][1:3], (365, 168)) < 4
+    finally:
+        tracker.close()
+
+
+def test_motion_learning_is_independent_of_frozen_appearance(monkeypatch):
+    from ringdet.motion import Motion
+    rng = np.random.default_rng(75)
+    image = synth.ground_texture(360, 640, rng, amp=12)
+    synth.draw_ring(image, 320, 180, 18, 2, 75)
+    image = synth.degrade(image, rng)
+    tracker = RingTracker(Params(), Camera.default(640, 360))
+    tracker.set_click(320, 180)
+    try:
+        for i in range(15):
+            result = tracker.process(image, i / 30, i)
+        assert result.state == 'DETECTED' and tracker.online is not None
+        working = tracker.template['image'].copy()
+        spectrum = tracker.online['spectrum'].copy()
+        reference = tracker.references[0]['image'].copy()
+        monkeypatch.setattr(tracker, '_reference_score', lambda *_: .7)
+        monkeypatch.setattr(tracker.motion, 'update', lambda _: Motion(np.float64([[1, 0, 3], [0, 1, 0]]), 80))
+        for k in range(1, 13):
+            moved = cv2.warpAffine(image, np.float32([[1, 0, 3 * k], [0, 1, 0]]), (640, 360))
+            result = tracker.process(moved, (14 + k) / 30, 14 + k)
+            assert result.state == 'DETECTED'
+        assert tracker.learned['stamp'] == pytest.approx(26 / 30)
+        assert tracker.learned['velocity'][0] > 60
+        np.testing.assert_array_equal(tracker.template['image'], working)
+        np.testing.assert_array_equal(tracker.online['spectrum'], spectrum)
+        np.testing.assert_array_equal(tracker.references[0]['image'], reference)
+    finally:
+        tracker.close()
 
 
 def test_shared_fft_ncc_matches_opencv():

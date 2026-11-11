@@ -142,6 +142,7 @@ class RingTracker:
         self.recovery_candidate = None
         self.pending = []
         self.learned = None
+        self.online = None
         self._template_frame = -1
         self._template_result = None
         self._match_cache = OrderedDict()
@@ -264,6 +265,8 @@ class RingTracker:
         self.dbg['noise'] = fr.last_noise
         self.dbg['motion_backend'] = self.motion.backend
         self.dbg['template_backend'] = self.template_backend
+        self.dbg['online_active'] = self.P.track.online_learning and self.online is not None
+        self.dbg['online_updates'] = 0 if self.online is None else self.online['updates']
         self.dbg['cands'] = [(c.cx, c.cy, c.r, int(sum(c.hits))) for c in self.cands]
         self.dbg['ms'] = (time.perf_counter() - t0) * 1000
         return self._result(frame_id, stamp)
@@ -291,6 +294,8 @@ class RingTracker:
             self.tgt = [x, y, self.tgt[2] * s]
         if self.template is not None:
             self.template_angle += math.degrees(math.atan2(T.A[1, 0], T.A[0, 0]))
+        if self.online is not None:
+            self.online['angle'] += math.degrees(math.atan2(T.A[1, 0], T.A[0, 0]))
         for ref in self.references:
             ref['angle'] += math.degrees(math.atan2(T.A[1, 0], T.A[0, 0]))
         if self.recovery_candidate is not None:
@@ -324,6 +329,7 @@ class RingTracker:
         self.recovery_candidate = None
         self.pending = []
         self.learned = None
+        self.online = None
         self._template_frame = -1
         self._template_result = None
         self._match_cache.clear()
@@ -335,9 +341,32 @@ class RingTracker:
 
     # ---------- 跟踪 ----------
     def _remember(self, fr, m):
+        TP, V = self.P.track, self.P.verify
         if m.sectors < 12 or m.inlier_ratio < 0.75:
             return
-        if self.references and (self.template_hold or self._reference_score(fr, m) < self.P.track.identity_score):
+        strong = m.sectors >= V.lock_sectors and m.inlier_ratio >= V.lock_min_inlier_ratio
+        if not self.template_hold and strong:
+            observation = np.array([m.cx, m.cy, math.log(m.r)])
+            shape, alpha = m.line_w / m.r, TP.learn_rate
+            if self.learned is None:
+                self.learned = dict(observation=observation, stamp=self._stamp, frame_stamp=self._stamp,
+                                    velocity=np.zeros(3), hits=1, width=shape, width_var=0.0)
+            else:
+                history = self.learned
+                dt = self._stamp - history['stamp']
+                if 0 < dt <= 0.2:
+                    velocity = (observation - history['observation']) / dt
+                    history['velocity'] = (1 - alpha) * history['velocity'] + alpha * velocity
+                    history['hits'] += 1
+                else:
+                    history['velocity'][:] = 0
+                    history['hits'] = 1
+                error = shape - history['width']
+                history['width'] += alpha * error
+                history['width_var'] = (1 - alpha) * (history['width_var'] + alpha * error ** 2)
+                history.update(observation=observation, stamp=self._stamp, frame_stamp=self._stamp)
+        score = self._reference_score(fr, m)
+        if self.template_hold or score < TP.identity_score:
             return
         half = max(8, int(math.ceil(2.5 * m.r)))
         H, W = fr.shape
@@ -347,45 +376,149 @@ class RingTracker:
         patch = cv2.getRectSubPix(fr.u8('gray'), (size, size), (m.cx, m.cy))
         if size > 96:
             patch = cv2.resize(patch, (96, 96), interpolation=cv2.INTER_AREA)
-        alpha = self.P.track.learn_rate
+        confidence = float(np.clip((score - TP.identity_score) / max(1e-6, 1 - TP.identity_score), .1, 1))
+        confidence *= min(1.0, m.sectors / V.sectors) * min(1.0, m.inlier_ratio / V.lock_min_inlier_ratio)
+        alpha = TP.learn_rate * confidence
         if self.template is not None:
             n = patch.shape[0]
             old = cv2.resize(self.template['image'], (n, n), interpolation=cv2.INTER_LINEAR)
             if abs(self.template_angle) > 0.5:
                 A = cv2.getRotationMatrix2D(((n - 1) / 2, (n - 1) / 2), -self.template_angle, 1)
                 old = cv2.warpAffine(old, A, (n, n), borderMode=cv2.BORDER_REFLECT_101)
-            adaptive = cv2.addWeighted(old, 1 - alpha, patch, alpha, 0)
+            adaptive = cv2.addWeighted(old, 1 - TP.learn_rate, patch, TP.learn_rate, 0)
         else:
             adaptive = patch.copy()
         self.template = dict(image=adaptive, size=size, r=m.r)
         self.template_angle = 0.0
-        if not self.references or (not self.template_hold and self.identity_hits >= self.P.track.template_update_hits
-                                   and m.sectors >= self.P.verify.lock_sectors
-                                   and m.inlier_ratio >= self.P.verify.lock_min_inlier_ratio
-                                   and self._reference_score(fr, m) >= self.P.track.identity_score):
-            ref = dict(image=patch.copy(), size=size, r=m.r, angle=0.0)
-            self.references = self.references[:1] + self.references[1:][-2:] + [ref]
+        if not self.references or (strong and self.identity_hits >= TP.template_update_hits):
+            ref = dict(image=patch.copy(), size=size, r=m.r, angle=0.0, stamp=self._stamp)
+            if len(self.references) < 4:
+                self.references.append(ref)
+            else:
+                key, recent = self.references[1], self.references[-2]
+                if (abs(math.log(recent['r'] / key['r'])) >= math.log(1.08)
+                        or abs(recent['angle'] - key['angle']) >= 10):
+                    key = recent
+                self.references = [self.references[0], key, self.references[-1], ref]
             self.reference_radius = m.r
             self.identity_hits = 0
-        observation = np.array([m.cx, m.cy, math.log(m.r)])
-        shape = m.line_w / m.r
-        if self.learned is None:
-            self.learned = dict(observation=observation, stamp=self._stamp, frame_stamp=self._stamp,
-                                velocity=np.zeros(3), hits=1, width=shape, width_var=0.0)
+        if strong and TP.online_learning and m.r >= TP.online_min_radius:
+            self._update_online(fr, m, alpha)
+
+    @staticmethod
+    def _online_features(gray, white):
+        gray, white = gray.astype(np.float32) / 255, white.astype(np.float32) / 255
+        contrast = gray - cv2.GaussianBlur(gray, (0, 0), 1.5)
+        scale = np.sqrt(cv2.GaussianBlur(contrast * contrast, (0, 0), 2) + .0004)
+        dx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3) / 8
+        dy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3) / 8
+        return np.stack((np.clip(contrast / scale, -3, 3),
+                         np.clip((white - cv2.GaussianBlur(white, (0, 0), 1.5)) / scale, -3, 3),
+                         np.clip(cv2.magnitude(dx, dy) / scale, 0, 3)))
+
+    @staticmethod
+    def _response_psr(response, point, valid):
+        x, y = point
+        background = valid.copy()
+        background[max(0, y - 4):y + 5, max(0, x - 4):x + 5] = False
+        values = response[background]
+        if values.size < 16:
+            return 0.0
+        return float((response[y, x] - np.mean(values)) / max(float(np.std(values)), 1e-6))
+
+    def _update_online(self, fr, m, alpha):
+        model, TP = self.online, self.P.track
+        if model is not None and self.n_frames - model['frame'] < TP.online_update_frames:
+            return
+        H, W = fr.shape
+        side = max(16, int(round(6 * m.r)))
+        if min(m.cx - side / 2, m.cy - side / 2, W - 1 - m.cx - side / 2, H - 1 - m.cy - side / 2) < 0:
+            return
+        n = 48
+        images = []
+        for ch in ('gray', 'white' if fr._bgr is not None else 'gray'):
+            image = cv2.getRectSubPix(fr.u8(ch), (side, side), (m.cx, m.cy))
+            image = cv2.resize(image, (n, n), interpolation=cv2.INTER_AREA)
+            if model is not None and abs(model['angle']) > .5:
+                A = cv2.getRotationMatrix2D(((n - 1) / 2, (n - 1) / 2), model['angle'], 1)
+                image = cv2.warpAffine(image, A, (n, n), borderMode=cv2.BORDER_REFLECT_101)
+            images.append(image)
+        spectrum = np.fft.fft2(self._online_features(*images), norm='ortho')
+        if model is None:
+            yy, xx = np.indices((n, n))
+            radius = n / 6
+            distance = np.hypot(np.minimum(yy, n - yy), np.minimum(xx, n - xx))
+            support = np.where(distance < 1.65 * radius,
+                               .15 + .85 * np.exp(-((distance - radius) / (.3 * radius)) ** 2), 0)
+            target = np.exp(-((xx - (n - 1) / 2) ** 2 + (yy - (n - 1) / 2) ** 2) / (2 * 1.25 ** 2))
+            model = dict(angle=0.0, mask=support, target=np.fft.fft2(target, norm='ortho'),
+                         spectrum=spectrum, filter=np.zeros_like(spectrum), updates=0)
         else:
-            history = self.learned
-            dt = self._stamp - history['stamp']
-            if 0 < dt <= 0.2:
-                velocity = (observation - history['observation']) / dt
-                history['velocity'] = (1 - alpha) * history['velocity'] + alpha * velocity
-                history['hits'] += 1
-            else:
-                history['velocity'][:] = 0
-                history['hits'] = 1
-            error = shape - history['width']
-            history['width'] += alpha * error
-            history['width_var'] = (1 - alpha) * (history['width_var'] + alpha * error ** 2)
-            history.update(observation=observation, stamp=self._stamp, frame_stamp=self._stamp)
+            response = np.fft.ifft2(np.sum(spectrum * model['filter'], axis=0), norm='ortho').real
+            point = cv2.minMaxLoc(response)[3]
+            psr = self._response_psr(response, point, np.ones(response.shape, bool))
+            self.dbg['online_update_psr'] = psr
+            if psr < TP.online_psr or math.hypot(point[0] - (n - 1) / 2, point[1] - (n - 1) / 2) > 3:
+                return
+            rate = min(alpha, .05) * min(1.0, psr / (2 * TP.online_psr))
+            model['spectrum'] = (1 - rate) * model['spectrum'] + rate * spectrum
+        spectrum = model['spectrum']
+        power = np.sum(np.abs(spectrum) ** 2, axis=0)
+        filt, dual, penalty = model['filter'].copy(), np.zeros_like(spectrum), 1.0
+        # 大图块提供真实背景负样本，空间约束使滤波器集中在环带及少量邻域。
+        for _ in range(4):
+            prior = filt - dual
+            auxiliary = prior + np.conj(spectrum) * (model['target'] - np.sum(spectrum * prior, axis=0)) / (power + penalty)
+            spatial = np.fft.ifft2(auxiliary + dual, norm='ortho').real
+            spatial *= penalty * model['mask'] ** 2 / (.05 + penalty * model['mask'] ** 2)
+            filt = np.fft.fft2(spatial, norm='ortho')
+            dual += auxiliary - filt
+            penalty *= 5
+        offsets = np.arange(-14, 15)
+        model['kernel'] = (spatial[:, (-offsets[:, None]) % n, (-offsets[None, :]) % n] / n).astype(np.float32)
+        model['filter'] = filt
+        response = np.fft.ifft2(np.sum(spectrum * filt, axis=0), norm='ortho').real
+        model['peak'] = float(np.max(response))
+        model['frame'] = self.n_frames
+        model['updates'] += 1
+        self.online = model
+        self.dbg['online_updates'] = model['updates']
+
+    def _online_peaks(self, fr, cx, cy, r, half):
+        model, TP = self.online, self.P.track
+        if not TP.online_learning or model is None or r < TP.online_min_radius:
+            return []
+        H, W = fr.shape
+        peaks = []
+        kernels = model['kernel']
+        if abs(model['angle']) > .5:
+            n = kernels.shape[1]
+            A = cv2.getRotationMatrix2D(((n - 1) / 2, (n - 1) / 2), -model['angle'], 1)
+            kernels = np.stack([cv2.warpAffine(k, A, (n, n)) for k in kernels])
+        scale = 8 / r
+        extent = min(half, 192 / scale)
+        x0, y0 = max(0, int(cx - extent)), max(0, int(cy - extent))
+        x1, y1 = min(W, int(cx + extent) + 1), min(H, int(cy + extent) + 1)
+        if x1 <= x0 or y1 <= y0 or min((x1 - x0) * scale, (y1 - y0) * scale) <= 30:
+            return []
+        images = [cv2.resize(fr.u8(ch)[y0:y1, x0:x1], None, fx=scale, fy=scale,
+                            interpolation=cv2.INTER_AREA) for ch in ('gray', 'white' if fr._bgr is not None else 'gray')]
+        features = self._online_features(*images)
+        response = sum(cv2.filter2D(f, cv2.CV_32F, k) for f, k in zip(features, kernels))
+        valid = np.zeros(response.shape, bool)
+        valid[14:-14, 14:-14] = True
+        search = np.where(valid, response, -np.inf)
+        for _ in range(2):
+            _, value, _, point = cv2.minMaxLoc(search)
+            psr = self._response_psr(response, point, valid)
+            if value < max(.03, .2 * model['peak']) or psr < TP.online_psr:
+                break
+            x, y = point
+            peaks.append((min(1.0, value / max(model['peak'], 1e-6)),
+                          x0 + (x + .5) / scale - .5, y0 + (y + .5) / scale - .5, r))
+            self.dbg['online_psr'] = max(self.dbg.get('online_psr', 0), psr)
+            cv2.circle(search, point, 8, -np.inf, -1)
+        return peaks
 
     def _reference_score(self, fr, m):
         if not self.references:
@@ -590,6 +723,16 @@ class RingTracker:
         x1, y1 = min(W, int(cx + half) + 1), min(H, int(cy + half) + 1)
         if x1 <= x0 or y1 <= y0:
             return None
+        online_peaks = self._online_peaks(fr, cx, cy, r, half)
+        online_candidate = None
+        if online_peaks and self.dbg.get('online_psr', 0) >= 2 * TP.online_psr:
+            online_candidate = self._recovery_from_peaks(fr, online_peaks, r, strict=True)
+            if self.ambiguous:
+                return None
+            if online_candidate is not None and online_candidate.identity_score >= .9:
+                self.dbg['recovery_source'] = 'online'
+                self._template_result = online_candidate
+                return online_candidate
         memories = [(self.template, self.template_angle)]
         if self.references:
             memories.append((self.references[-1], self.references[-1]['angle']))
@@ -626,14 +769,29 @@ class RingTracker:
                 y = y0 + (point[1] + n / 2) / scale - 0.5
                 peaks.append((score, x, y, r * ratio))
                 cv2.circle(scores, point, max(3, int(round(r * scale))), -1, -1)
+        self._template_result = self._recovery_from_peaks(fr, peaks, r)
+        if self._template_result is None and not self.ambiguous and online_peaks:
+            if online_candidate is None:
+                online_candidate = self._recovery_from_peaks(fr, online_peaks, r, strict=True)
+            if not self.ambiguous:
+                self._template_result = online_candidate
+                if online_candidate is not None:
+                    self.dbg['recovery_source'] = 'online'
+        return self._template_result
+
+    def _recovery_from_peaks(self, fr, peaks, r, strict=False):
+        TP, V = self.P.track, self.P.verify
         checked, valid = [], []
-        min_sectors = max(V.track_sectors, 12 if self.phase == REACQUIRE else 10)
+        min_sectors = V.lock_sectors if strict else max(V.track_sectors, 12 if self.phase == REACQUIRE else 10)
         for score, x, y, radius in sorted(peaks, reverse=True):
             if any(math.hypot(x - px, y - py) <= max(3, r) for px, py in checked):
                 continue
             checked.append((x, y))
             m = measure_channels(fr, self.cam, x, y, radius, V, 'track', local=True)
             self.dbg['recover_meas'] = m
+            if strict and (m.inlier_ratio < V.lock_min_inlier_ratio or m.max_gap > V.lock_max_gap
+                           or m.rms > _delta(V.lock_max_rms, m.r)):
+                continue
             if (m.reason.startswith('shift ') and m.sectors >= min_sectors and m.inlier_ratio >= 0.75
                     and math.hypot(m.cx - x, m.cy - y) <= max(8.0, 0.75 * r)):
                 m.ok, m.reason = True, ''
@@ -648,8 +806,7 @@ class RingTracker:
             self.ambiguous = True
             return None
         self.dbg['template_score'] = valid[0][0]
-        self._template_result = valid[0][1]
-        return self._template_result
+        return valid[0][1]
 
     def _step_track(self, fr, T, stamp):
         V, TP = self.P.verify, self.P.track

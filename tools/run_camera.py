@@ -236,6 +236,8 @@ def main():
     if trk.motion.backend_error:
         print(f'[CUDA] {trk.motion.backend_error}', file=sys.stderr)
     print(f'重捕匹配：{trk.template_backend}', file=sys.stderr)
+    print('在线滤波：' + (f'CPU 背景感知相关滤波，半径至少 {P.track.online_min_radius:g} px'
+                          if P.track.online_learning else '关闭，使用像素模板'), file=sys.stderr)
     if trk.template_backend_error:
         print(f'[CUDA 匹配] {trk.template_backend_error}', file=sys.stderr)
 

@@ -64,5 +64,7 @@ def draw_result(frame, res):
     timing = f"{d.get('ms', 0):.0f} ms  noise={d.get('noise', 0):.1f}  flow={d.get('motion_inliers', 0)}"
     if d.get('fps', 0) > 0:
         timing += f"  {d['fps']:.1f} FPS"
+    if d.get('online_active'):
+        timing += f"  online={d.get('online_updates', 0)}"
     text(img, timing, (10, 50))
     return img
