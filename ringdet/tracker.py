@@ -20,7 +20,7 @@ from .params import Params
 from . import edcircles as edc
 from .frame import Frame, frame_noise, noise_sigma  # noqa: F401  frame_noise 供工具脚本导入
 from .search import RingSearcher, EdJob, build_pyramid, merge_candidates, plan_ed, run_ed, confirm_ed, ED_SCORE
-from .verify import measure, _delta
+from .verify import Measurement, measure, _delta
 
 SEARCH, TRACK, COAST, REACQUIRE = 'SEARCH', 'TRACK', 'COAST', 'REACQUIRE'
 DETECTED, PREDICTED, LOST = 'DETECTED', 'PREDICTED', 'LOST'
@@ -64,6 +64,8 @@ class _Cand:
         self.last_pass = stamp
         self.created = stamp
         self.ed_hits = int(m.ed_ok)            # 有几帧得到 EDCircles 支持（全图检出或候选级放大检出）
+        self.reference = None
+        self.drift = np.zeros(2)
 
 
 def measure_channels(fr, cam, cx, cy, r, V, mode, delta=None, local=False):
@@ -124,6 +126,7 @@ class RingTracker:
         self.cands = []
         self.tgt = None            # [cx, cy, r]，当前帧坐标
         self.tgt_meas = None
+        self.measured_radius = None
         self.last_detect = None
         self.click = None
         self.reacq = None
@@ -135,9 +138,11 @@ class RingTracker:
         self._pending_click = None
         self.template = None
         self.template_angle = 0.0
+        self.keyframe = None
         self.references = []
         self.reference_radius = None
         self.identity_hits = 0
+        self.recent_identity_hits = 0
         self.stable_track_hits = 0
         self.coast_motion_lost = False
         self.template_hold = 0
@@ -147,6 +152,7 @@ class RingTracker:
         self.online = None
         self._template_frame = -1
         self._template_result = None
+        self._appearance_result = None
         self._match_cache = OrderedDict()
         self._match_cache_bytes = 0
         self.motion.reset()
@@ -257,13 +263,18 @@ class RingTracker:
             self._apply_click(stamp)
         self.out = LOST
         self.ambiguous = False
+        self._appearance_result = None
         self.dbg = dict(noise=noise, motion_inliers=self.motion.last_inliers,
                         motion_ok=T is not None, local_motion=self.motion.local_ok,
                         motion_error=self.motion.error, found=[], region=None, rejected={})
+        if T is not None and previous is not None:
+            self.dbg['motion_step_px'] = math.dist(T.apply(previous[0], previous[1]), previous[:2])
         if self.phase in (TRACK, COAST):
             self._step_track(fr, T, stamp)
         if self.phase in (SEARCH, REACQUIRE):
             self._step_search(fr, T, stamp)
+        if self.out != DETECTED:
+            self.recent_identity_hits = 0
         self.dbg['noise'] = fr.last_noise
         self.dbg['motion_backend'] = self.motion.backend
         self.dbg['template_backend'] = self.template_backend
@@ -299,9 +310,14 @@ class RingTracker:
         s = T.scale
         if self.reference_radius is not None:
             self.reference_radius *= s
+        if self.measured_radius is not None:
+            self.measured_radius *= s
         for c in self.cands:
             c.cx, c.cy = T.apply(c.cx, c.cy)
             c.r *= s
+            c.drift = T.A[:, :2] @ c.drift
+            if c.reference is not None:
+                c.reference['angle'] += math.degrees(math.atan2(T.A[1, 0], T.A[0, 0]))
         for c in self.pending:
             c.x, c.y = T.apply(c.x, c.y)
             c.r *= s
@@ -310,6 +326,8 @@ class RingTracker:
             self.tgt = [x, y, self.tgt[2] * s]
         if self.template is not None:
             self.template_angle += math.degrees(math.atan2(T.A[1, 0], T.A[0, 0]))
+        if self.keyframe is not None:
+            self.keyframe['angle'] += math.degrees(math.atan2(T.A[1, 0], T.A[0, 0]))
         if self.online is not None:
             self.online['angle'] += math.degrees(math.atan2(T.A[1, 0], T.A[0, 0]))
         for ref in self.references:
@@ -336,11 +354,14 @@ class RingTracker:
         self.reacq = None
         self.r_floor = None
         self.tgt = None
+        self.measured_radius = None
         self.template = None
         self.template_angle = 0.0
+        self.keyframe = None
         self.references = []
         self.reference_radius = None
         self.identity_hits = 0
+        self.recent_identity_hits = 0
         self.stable_track_hits = 0
         self.coast_motion_lost = False
         self.template_hold = 0
@@ -350,6 +371,7 @@ class RingTracker:
         self.online = None
         self._template_frame = -1
         self._template_result = None
+        self._appearance_result = None
         self._match_cache.clear()
         self._match_cache_bytes = 0
         self.cursor = 0
@@ -358,9 +380,23 @@ class RingTracker:
         self.click = dict(x=x, y=y, side=self.P.search.click_box, level=0, t_level=stamp, scale=1.0)
 
     # ---------- 跟踪 ----------
+    def _identity_patch(self, fr, m):
+        half = max(16, int(math.ceil(2.5 * m.r)))
+        H, W = fr.shape
+        if min(m.cx - half, m.cy - half, W - 1 - m.cx - half, H - 1 - m.cy - half) < 0:
+            half = max(16, int(math.ceil(1.5 * m.r)))
+        if min(m.cx - half, m.cy - half, W - 1 - m.cx - half, H - 1 - m.cy - half) < 0:
+            return None
+        size = 2 * half + 1
+        patch = cv2.getRectSubPix(fr.u8('gray'), (size, size), (m.cx, m.cy))
+        if size > 96:
+            patch = cv2.resize(patch, (96, 96), interpolation=cv2.INTER_AREA)
+        return dict(image=patch, size=size, r=m.r, angle=0.0, stamp=self._stamp)
+
     def _remember(self, fr, m):
         TP, V = self.P.track, self.P.verify
         if m.sectors < 12 or m.inlier_ratio < 0.75:
+            self.recent_identity_hits = 0
             return
         strong = m.sectors >= V.lock_sectors and m.inlier_ratio >= V.lock_min_inlier_ratio
         if not self.template_hold and strong:
@@ -385,17 +421,31 @@ class RingTracker:
                 history.update(observation=observation, stamp=self._stamp, frame_stamp=self._stamp)
         score = self._reference_score(fr, m)
         self.dbg['target_identity_score'] = score
-        if self.template_hold or score < TP.identity_score:
+        # 旧参考失配时，短期适应仍须由连续可靠测量支撑。
+        recent_score = -1.0
+        continuous = (strong and m.max_gap <= V.lock_max_gap
+                and m.rms <= _delta(V.lock_max_rms, m.r) and self.dbg.get('motion_ok')
+                and not self.template_hold and self.keyframe is not None
+                and self._stamp - self.keyframe['stamp'] <= TP.coast_s
+                and self.dbg.get('measurement_shift', math.inf) <= max(3.0, 0.15 * m.r,
+                                                                       2 * self.dbg.get('motion_error', 0))
+                and self.learned is not None and self.learned['hits'] >= 3)
+        if score < TP.identity_score and continuous:
+            recent_score = self._reference_score(fr, m, [self.keyframe])
+            self.dbg['recent_identity_score'] = recent_score
+        consistent = recent_score >= max(0.9, TP.identity_score)
+        self.recent_identity_hits = self.recent_identity_hits + 1 if consistent else 0
+        if self.template_hold:
             return
-        half = max(8, int(math.ceil(2.5 * m.r)))
-        H, W = fr.shape
-        if min(m.cx - half, m.cy - half, W - 1 - m.cx - half, H - 1 - m.cy - half) < 0:
+        ref = self._identity_patch(fr, m)
+        if ref is None:
             return
-        size = 2 * half + 1
-        patch = cv2.getRectSubPix(fr.u8('gray'), (size, size), (m.cx, m.cy))
-        if size > 96:
-            patch = cv2.resize(patch, (96, 96), interpolation=cv2.INTER_AREA)
-        confidence = float(np.clip((score - TP.identity_score) / max(1e-6, 1 - TP.identity_score), .1, 1))
+        if strong and (score >= TP.identity_score or continuous):
+            self.keyframe = ref.copy()
+        if score < TP.identity_score and not consistent:
+            return
+        patch, size = ref['image'], ref['size']
+        confidence = float(np.clip((max(score, recent_score) - TP.identity_score) / max(1e-6, 1 - TP.identity_score), .1, 1))
         confidence *= min(1.0, m.sectors / V.sectors) * min(1.0, m.inlier_ratio / V.lock_min_inlier_ratio)
         alpha = TP.learn_rate * confidence
         if self.template is not None:
@@ -404,13 +454,18 @@ class RingTracker:
             if abs(self.template_angle) > 0.5:
                 A = cv2.getRotationMatrix2D(((n - 1) / 2, (n - 1) / 2), -self.template_angle, 1)
                 old = cv2.warpAffine(old, A, (n, n), borderMode=cv2.BORDER_REFLECT_101)
-            adaptive = cv2.addWeighted(old, 1 - TP.learn_rate, patch, TP.learn_rate, 0)
+            extent = (size / m.r) / (self.template['size'] / self.template['r'])
+            rate = min(TP.learn_rate, .05) if consistent else TP.learn_rate
+            # 采样范围改变后，旧图块不能按相同物理尺度混合。
+            adaptive = (cv2.addWeighted(old, 1 - rate, patch, rate, 0)
+                        if abs(math.log(extent)) <= math.log(1.08) else patch.copy())
         else:
             adaptive = patch.copy()
         self.template = dict(image=adaptive, size=size, r=m.r)
         self.template_angle = 0.0
-        if not self.references or (strong and self.identity_hits >= TP.template_update_hits):
-            ref = dict(image=patch.copy(), size=size, r=m.r, angle=0.0, stamp=self._stamp)
+        promote = (self.recent_identity_hits >= TP.template_update_hits
+                   or score >= TP.identity_score and self.identity_hits >= TP.template_update_hits)
+        if not self.references or strong and promote:
             if len(self.references) < 4:
                 self.references.append(ref)
             else:
@@ -421,6 +476,7 @@ class RingTracker:
                 self.references = [self.references[0], key, self.references[-1], ref]
             self.reference_radius = m.r
             self.identity_hits = 0
+            self.recent_identity_hits = 0
         if strong and TP.online_learning and m.r >= TP.online_min_radius:
             self._update_online(fr, m, alpha)
 
@@ -539,15 +595,16 @@ class RingTracker:
             cv2.circle(search, point, 8, -np.inf, -1)
         return peaks
 
-    def _reference_score(self, fr, m):
-        if not self.references:
+    def _reference_score(self, fr, m, references=None):
+        references = self.references if references is None else references
+        if not references:
             return 1.0
-        key = (m.cx, m.cy, m.r, tuple(id(ref) for ref in self.references))
+        key = (m.cx, m.cy, m.r, tuple(id(ref) for ref in references))
         if key in self._identity_cache:
             return self._identity_cache[key]
         H, W = fr.shape
         scores = []
-        for ref in self.references:
+        for ref in references:
             best = -1.0
             n = ref['image'].shape[0]
             for ratio in (1.0, 0.9, 1.1):
@@ -695,6 +752,7 @@ class RingTracker:
         self.coast_motion_lost = False
         self.tgt = [m.cx, m.cy, m.r]
         self.tgt_meas = m
+        self.measured_radius = m.r
         self.last_detect = stamp
         self.out = DETECTED
         self.reacq = None
@@ -703,6 +761,7 @@ class RingTracker:
         self.recovery_candidate = None
         self.template_hold = self.P.track.template_update_hits
         self.identity_hits = 0
+        self.recent_identity_hits = 0
 
     def _appearance_score(self, fr, m):
         if self.template is None:
@@ -721,11 +780,16 @@ class RingTracker:
         return float(cv2.matchTemplate(patch, self.template['image'], cv2.TM_CCOEFF_NORMED)[0, 0])
 
     def _recover_shift(self, fr, m, cx, cy, r):
-        # 几何已通过、仅位置门限失败时，用原目标外观确认较大的圆心修正。
-        if (self.template is not None and m.reason.startswith('shift ')
+        radius_error = m.reason.startswith('radius ')
+        scale_ok = (self.reference_radius is not None
+                    and abs(m.r - self.reference_radius) <= 0.2 * self.reference_radius
+                    and m.sectors >= self.P.verify.lock_sectors
+                    and m.inlier_ratio >= self.P.verify.lock_min_inlier_ratio)
+        if (self.template is not None and (m.reason.startswith('shift ') or (radius_error and scale_ok))
                 and m.sectors >= 12 and m.inlier_ratio >= 0.75
                 and math.hypot(m.cx - cx, m.cy - cy) <= max(8.0, 0.75 * r)
-                and self._appearance_score(fr, m) >= self.P.track.template_score):
+                and self._appearance_score(fr, m) >= self.P.track.template_score
+                and (not radius_error or self._reference_score(fr, m) >= self.P.track.identity_score)):
             m.ok, m.reason = True, ''
 
     def _template_measure(self, fr, stamp):
@@ -746,7 +810,11 @@ class RingTracker:
         # 弱测量可能缩小半径，重捕保留随地面运动传播的可靠尺度。
         r = max(r, self.reference_radius or r)
         age = max(0.0, stamp - self.last_detect)
-        half = max(TP.reacq_box_min / 2, TP.reacq_box_r * r / 2) * min(3.0, 1 + age)
+        base = max(TP.reacq_box_min / 2, TP.reacq_box_r * r / 2)
+        uncertainty = min(base, 0.5 * self.dbg.get('motion_step_px', 0) + 3 * self.dbg.get('motion_error', 0))
+        if not self.dbg.get('motion_ok'):
+            uncertainty = max(uncertainty, 0.5 * base)
+        half = base * min(3.0, 1 + age) + uncertainty
         H, W = fr.shape
         x0, y0 = max(0, int(cx - half)), max(0, int(cy - half))
         x1, y1 = min(W, int(cx + half) + 1), min(H, int(cy + half) + 1)
@@ -763,16 +831,24 @@ class RingTracker:
                 self._template_result = online_candidate
                 return online_candidate
         memories = [(self.template, self.template_angle)]
+        if self.keyframe is not None:
+            memories.insert(0, (self.keyframe, self.keyframe['angle']))
         if self.references:
             memories.append((self.references[-1], self.references[-1]['angle']))
             if len(self.references) > 1:
                 memories.append((self.references[0], self.references[0]['angle']))
+        unique, seen = [], set()
+        for memory, angle in memories:
+            if id(memory['image']) not in seen:
+                unique.append((memory, angle))
+                seen.add(id(memory['image']))
+        memories = unique
         size = self.template['size'] * r / self.template['r']
-        scale = min(1.0, 96 / max(size * 1.1, 1))
         roi = fr.u8('gray')[y0:y1, x0:x1]
+        scale = min(1.0, 96 / max(size * 1.1, 1), 512 / max(roi.shape))
         if scale < 1:
             roi = cv2.resize(roi, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-        peaks, patches, sizes = [], [], []
+        peaks, patches, sizes, appearance = [], [], [], []
         for memory, angle in memories:
             template = memory['image']
             if abs(angle) > 0.5:
@@ -787,9 +863,10 @@ class RingTracker:
                     continue
                 patch = cv2.resize(template, (n, n), interpolation=cv2.INTER_LINEAR)
                 patches.append(patch)
-                sizes.append((n, ratio))
+                sizes.append((n, ratio, memory is self.keyframe))
         score_maps = self._match_templates(roi, patches)
-        for scores, (n, ratio) in zip(score_maps, sizes):
+        for scores, (n, ratio, clear) in zip(score_maps, sizes):
+            mean, deviation = cv2.meanStdDev(scores)
             for _ in range(2):
                 _, score, _, point = cv2.minMaxLoc(scores)
                 if score < TP.template_score:
@@ -797,6 +874,9 @@ class RingTracker:
                 x = x0 + (point[0] + n / 2) / scale - 0.5
                 y = y0 + (point[1] + n / 2) / scale - 0.5
                 peaks.append((score, x, y, r * ratio))
+                if clear:
+                    psr = (score - float(mean[0, 0])) / max(float(deviation[0, 0]), 1e-6)
+                    appearance.append((score, x, y, psr))
                 cv2.circle(scores, point, max(3, int(round(r * scale))), -1, -1)
         self._template_result = self._recovery_from_peaks(fr, peaks, r)
         if self._template_result is None and not self.ambiguous and online_peaks:
@@ -806,6 +886,43 @@ class RingTracker:
                 self._template_result = online_candidate
                 if online_candidate is not None:
                     self.dbg['recovery_source'] = 'online'
+        if (self._template_result is None and not self.ambiguous and self.keyframe is not None
+                and age <= TP.appearance_coast_s):
+            ranked = []
+            for peak in sorted(appearance, reverse=True):
+                if not any(math.hypot(peak[1] - p[1], peak[2] - p[2]) <= max(4, r) for p in ranked):
+                    ranked.append(peak)
+            if (ranked and ranked[0][0] >= TP.appearance_score
+                    and (len(ranked) == 1 or ranked[0][0] - ranked[1][0] >= TP.identity_margin)):
+                score, x, y, psr = ranked[0]
+                motion_agrees = (not self.dbg.get('motion_ok') or self.coast_motion_lost
+                                 or math.dist((x, y), self.tgt[:2]) <= max(3.0, 0.25 * r,
+                                                                          2 * self.dbg.get('motion_error', 0)))
+                if psr >= TP.appearance_psr and motion_agrees:
+                    hypothesis = Measurement(False, 'appearance', cx=x, cy=y, r=r)
+                    ref = self.keyframe
+                    side = max(9, int(round(ref['size'] * r / ref['r'])))
+                    n = ref['image'].shape[0]
+                    patch = cv2.getRectSubPix(fr.u8('gray'), (side, side), (x, y))
+                    patch = cv2.resize(patch, (n, n), interpolation=cv2.INTER_AREA)
+                    if abs(ref['angle']) > .5:
+                        A = cv2.getRotationMatrix2D(((n - 1) / 2, (n - 1) / 2), ref['angle'], 1)
+                        patch = cv2.warpAffine(patch, A, (n, n), borderMode=cv2.BORDER_REFLECT_101)
+                    # 环带核心单独复核，避免周边纹理主导定位。
+                    yy, xx = np.indices((n, n))
+                    distance = np.hypot(xx - (n - 1) / 2, yy - (n - 1) / 2)
+                    radius = ref['r'] * n / ref['size']
+                    weight = np.where(distance <= 1.5 * radius,
+                                      .2 + np.exp(-((distance - radius) / max(1, .3 * radius)) ** 2), 0)
+                    first = ref['image'].astype(np.float32)
+                    first -= np.sum(first * weight) / np.sum(weight)
+                    second = patch.astype(np.float32)
+                    second -= np.sum(second * weight) / np.sum(weight)
+                    den = math.sqrt(float(np.sum(first * first * weight) * np.sum(second * second * weight)))
+                    ring_score = float(np.sum(first * second * weight)) / max(den, 1e-6)
+                    if ring_score >= 0.5 and self._reference_score(fr, hypothesis) >= TP.template_score:
+                        self._appearance_result = hypothesis
+                        self.dbg.update(appearance_ncc=score, appearance_psr=psr, appearance_ring=ring_score)
         return self._template_result
 
     def _recovery_from_peaks(self, fr, peaks, r, strict=False):
@@ -852,6 +969,14 @@ class RingTracker:
             delta = None
         m = measure_channels(fr, self.cam, cx, cy, r, V, 'track', delta, local=True)
         self._recover_shift(fr, m, cx, cy, r)
+        alternate = self.measured_radius
+        if (not m.ok and alternate is not None and since <= TP.coast_s
+                and 0.005 * r < abs(alternate - r) <= 0.1 * r):
+            retry = measure_channels(fr, self.cam, cx, cy, alternate, V, 'track', delta, local=True)
+            self._recover_shift(fr, retry, cx, cy, alternate)
+            if retry.ok and self._reference_score(fr, retry) >= TP.identity_score:
+                m = retry
+                self.dbg['scale_retry'] = True
         self.dbg['track_meas'] = m
         if not m.ok or self.coast_motion_lost:
             recovered = m if m.ok and self._recovery_identity(fr, m) else None
@@ -876,10 +1001,22 @@ class RingTracker:
                     self.out = LOST
                 return
             self.recovery_candidate = None
+            if self._appearance_result is not None:
+                estimate = self._appearance_result
+                self.tgt = [estimate.cx, estimate.cy, estimate.r]
+                self.phase = COAST
+                self.out = PREDICTED
+                self.coast_motion_lost |= T is None
+                self.dbg['prediction_source'] = 'appearance'
+                return
         if m.ok and not self.coast_motion_lost:
             self.phase = TRACK
-            self.tgt = [m.cx, m.cy, m.r]
+            self.dbg['measurement_shift'] = math.hypot(m.cx - cx, m.cy - cy)
+            strong = m.sectors >= V.lock_sectors and m.inlier_ratio >= V.lock_min_inlier_ratio
+            radius = m.r if strong or self.reference_radius is None else self.reference_radius
+            self.tgt = [m.cx, m.cy, radius]
             self.tgt_meas = m
+            self.measured_radius = m.r
             self.last_detect = stamp
             self.out = DETECTED
             if m.sectors >= V.lock_sectors and m.inlier_ratio >= V.lock_min_inlier_ratio:
@@ -954,6 +1091,8 @@ class RingTracker:
             # 最大可见半径约为画面对角线的一半，超过它的环已经看不全
             r_lo = max(r_lo, self.r_floor)
             r_hi = max(r_hi, min(1.6 * self.r_floor, 0.5 * math.hypot(W, H)))
+            if self.reference_radius is not None:
+                r_hi = max(r_hi, min(1.5 * self.reference_radius, 0.5 * math.hypot(W, H)))
         region = (0, 0, W, H)
         ref = (W / 2, H / 2)          # 没有点击时：飞机基本在目标上方，画面中心作参考
         if self.click is not None:
@@ -979,9 +1118,19 @@ class RingTracker:
         region = (max(0, region[0]), max(0, region[1]), min(W, region[2]), min(H, region[3]))
         self.dbg['region'] = region
         self.dbg['r_range'] = (r_lo, r_hi)
-        # 长时丢失定期留出几何搜索帧，避免模板匹配耗尽预算。
-        try_template = (self.recovery_candidate is not None or self.n_frames % 3 != 0
-                        or self.last_detect is None or stamp - self.last_detect <= TP.coast_s)
+        if (self.phase == REACQUIRE and T is not None and self.tgt is not None
+                and not self.cands and 'track_meas' not in self.dbg and time.perf_counter() < deadline):
+            cx, cy, r = self.tgt
+            m = measure_channels(fr, self.cam, cx, cy, r, V, 'lock', local=True)
+            self.dbg['recover_meas'] = m
+            if m.ok and self._recovery_identity(fr, m):
+                if self._confirm_recovery(m, stamp):
+                    self._accept_recovery(m, stamp)
+                return
+        # 先确认已有几何候选，无候选时交替外观匹配与区域搜索。
+        try_template = not self.cands and (self.recovery_candidate is not None or self.n_frames % 3 != 0
+                        or self.last_detect is None
+                        or stamp - self.last_detect <= min(TP.coast_s, TP.stable_no_flow_s))
         if self.phase == REACQUIRE and try_template:
             m = self._template_measure(fr, stamp)
             if self.ambiguous:
@@ -1011,6 +1160,14 @@ class RingTracker:
                                  local=self.click is not None)
             if m.ok and not self._recovery_identity(fr, m):
                 m.ok, m.reason = False, 'appearance'
+            if m.ok and not self.references:
+                # 累积相对地面的残差，排除移动的近圆亮块。
+                drift = c.drift + (m.cx - c.cx, m.cy - c.cy)
+                score = self._reference_score(fr, m, [c.reference]) if c.reference is not None else -1
+                if score < TP.identity_score or np.linalg.norm(drift) > max(3.0, 0.5 * m.r):
+                    m.ok, m.reason = False, 'initial identity'
+                else:
+                    c.drift = drift
             if self.references:
                 if c.frame != self.n_frames - 1:
                     c.hits.clear()
@@ -1139,8 +1296,14 @@ class RingTracker:
                 continue
             idle = self._ed_future is None or self._ed_future.done()
             m.ed_ok = m.source == 'ed' or (idle and ed_support(fr, m, S, V))
-            candidate = _Cand(m, stamp, max(TP.confirm_window, TP.reacq_weak_hits) if self.references else TP.confirm_window)
-            candidate.needed = (TP.reacq_confirm_hits if m.identity_score >= TP.identity_score else TP.reacq_weak_hits) if self.references else TP.confirm_hits
+            window = max(TP.confirm_window, TP.reacq_weak_hits if self.references else TP.identity_init_hits + 2)
+            candidate = _Cand(m, stamp, window)
+            candidate.needed = ((TP.reacq_confirm_hits if m.identity_score >= TP.identity_score else TP.reacq_weak_hits)
+                                if self.references else max(TP.confirm_hits, TP.identity_init_hits))
+            if not self.references:
+                candidate.reference = self._identity_patch(fr, m)
+                if candidate.reference is None:
+                    continue
             candidate.frame = self.n_frames
             self.cands.append(candidate)
             any_pass = True
@@ -1185,6 +1348,7 @@ class RingTracker:
             self.phase = TRACK
             self.tgt = [win.cx, win.cy, win.r]
             self.tgt_meas = win.meas
+            self.measured_radius = win.r
             self.last_detect = stamp
             self.cands = []
             self.reacq = None

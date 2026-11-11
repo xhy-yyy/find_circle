@@ -124,6 +124,7 @@ class MotionParams:
 class TrackParams:
     confirm_window: int = 5      # 最近 confirm_window 个处理帧中
     confirm_hits: int = 3        # 至少 confirm_hits 帧通过，且当前帧通过
+    identity_init_hits: int = 6
     assoc: Tuple[float, float] = (3.0, 0.25)   # 同一候选：中心差 <= max(a, b*r)
     assoc_radius: float = 0.15   # 且半径差 <= 15%
     max_cands: int = 30
@@ -132,6 +133,9 @@ class TrackParams:
     coast_s: float = 0.3
     stable_track_frames: int = 6
     stable_no_flow_s: float = 0.12
+    appearance_coast_s: float = 0.5
+    appearance_score: float = 0.85
+    appearance_psr: float = 2.0
     reacq_box_r: float = 6.0     # 重捕框边长 = 6r
     reacq_box_min: float = 240.0  # 小环重捕框的最小边长（原图 px）
     reacq_radius: float = 0.25   # 重捕半径范围 ±25%

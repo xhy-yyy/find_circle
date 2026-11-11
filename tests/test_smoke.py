@@ -66,7 +66,7 @@ def test_tracker_locks_and_follows():
         if res.state == 'DETECTED':
             assert math.hypot(res.center_px[0] - gt[0], res.center_px[1] - gt[1]) < 1.0
     first = states.index('DETECTED')
-    assert first <= 10
+    assert first <= 12
     # 首锁前给出点击点位置，首锁后清空
     assert clicks[0] is not None and clicks[first] is None
     assert states[first:].count('DETECTED') >= 0.9 * (len(states) - first)
@@ -106,6 +106,134 @@ def test_target_motion_ignores_different_foreground_motion():
     transform = motion.update(second)
     assert transform is not None
     assert math.dist(transform.apply(510, 180), (514, 178)) < 1
+
+
+def test_global_recovery_retains_growing_target_scale(monkeypatch):
+    from ringdet.motion import Motion
+    rng = np.random.default_rng(85)
+    image = synth.ground_texture(480, 640, rng)
+    synth.draw_ring(image, 320, 240, 45, 3, 75)
+    image = synth.degrade(image, rng)
+    tracker = RingTracker(Params(), Camera.default(640, 480))
+    tracker.set_click(320, 240)
+    for i in range(24):
+        result = tracker.process(image, i / 30, i)
+    assert result.state == 'DETECTED'
+    stamp = tracker.last_detect
+    tracker.phase = 'REACQUIRE'
+    tracker.reacq = dict(start=stamp, x=320., y=240., r=tracker.tgt[2])
+    A = cv2.getRotationMatrix2D((320, 240), 0, 1.8)
+    moved = cv2.warpAffine(image, A, (640, 480))
+    monkeypatch.setattr(tracker.motion, 'update', lambda _: Motion(A, 80))
+    result = tracker.process(moved, stamp + 3.1, 24)
+    assert result.debug['r_range'][1] > 81
+    monkeypatch.setattr(tracker.motion, 'update', lambda _: Motion(np.float64([[1, 0, 0], [0, 1, 0]]), 80))
+    for i in range(25, 45):
+        result = tracker.process(moved, stamp + 3.1 + (i - 24) / 30, i)
+        if result.state == 'DETECTED':
+            break
+    assert result.state == 'DETECTED' and result.target_id == 1
+    assert math.dist(result.center_px, (320, 240)) < 2
+    assert abs(result.radius_px - 81) < 2
+    tracker.close()
+
+
+def test_initial_identity_rejects_target_moving_relative_to_ground(monkeypatch):
+    from ringdet.motion import Motion
+    rng = np.random.default_rng(81)
+    ground = synth.ground_texture(360, 640, rng)
+    tracker = RingTracker(Params(), Camera.default(640, 360))
+    tracker.set_click(320, 180)
+    monkeypatch.setattr(tracker.motion, 'update', lambda _: Motion(np.float64([[1, 0, 0], [0, 1, 0]]), 80))
+    states = []
+    for i in range(32):
+        image = ground.copy()
+        x = 320 + 2 * min(i, 12)
+        synth.draw_ring(image, x, 180, 12, 1.5, 80)
+        result = tracker.process(synth.degrade(image, rng, noise=0), i / 30, i)
+        if i < 12:
+            assert result.state == 'LOST' and not tracker.references
+        states.append(result.state)
+        if result.state == 'DETECTED':
+            assert math.dist(result.center_px, (344, 180)) < 1.5
+    assert 'DETECTED' in states[12:]
+    tracker.close()
+
+
+def test_keyframe_position_survives_geometry_failure_and_expires(monkeypatch):
+    import ringdet.tracker as tracker_module
+    from ringdet.verify import Measurement
+    rng = np.random.default_rng(82)
+    image = synth.ground_texture(360, 640, rng)
+    synth.draw_ring(image, 320, 180, 18, 2, 75)
+    image = synth.degrade(image, rng)
+    tracker = RingTracker(Params(), Camera.default(640, 360))
+    tracker.set_click(320, 180)
+    for i in range(24):
+        result = tracker.process(image, i / 30, i)
+    assert result.state == 'DETECTED' and tracker.keyframe is not None
+    protected = tracker.references[0]['image'].copy()
+    updates = tracker.online['updates']
+    detected = tracker.last_detect
+    monkeypatch.setattr(tracker.motion, 'update', lambda _: None)
+    monkeypatch.setattr(tracker_module, 'measure_channels', lambda *_args, **_kwargs: Measurement(False, 'few_valid'))
+    shifted = cv2.warpAffine(image, np.float32([[1, 0, 7], [0, 1, -4]]), (640, 360))
+    result = tracker.process(shifted, 24 / 30, 24)
+    assert result.state == 'PREDICTED' and result.debug['prediction_source'] == 'appearance'
+    assert math.dist(result.center_px, (327, 176)) < 1.5
+    assert tracker.last_detect == detected and tracker.online['updates'] == updates
+    np.testing.assert_array_equal(tracker.references[0]['image'], protected)
+    result = tracker.process(shifted, detected + tracker.P.track.appearance_coast_s + .01, 25)
+    assert result.state == 'LOST' and result.center_px is None
+    tracker.close()
+
+
+def test_keyframe_prediction_rejects_equal_appearance_peaks(monkeypatch):
+    import ringdet.tracker as tracker_module
+    from ringdet.verify import Measurement
+    rng = np.random.default_rng(83)
+    background = synth.ground_texture(360, 640, rng)
+    image = background.copy()
+    synth.draw_ring(image, 320, 180, 18, 2, 75)
+    image = synth.degrade(image, rng)
+    tracker = RingTracker(Params(), Camera.default(640, 360))
+    tracker.set_click(320, 180)
+    for i in range(24):
+        result = tracker.process(image, i / 30, i)
+    assert result.state == 'DETECTED'
+    canvas = np.clip(background, 0, 255).astype(np.uint8)
+    patch = tracker.keyframe['image']
+    n = patch.shape[0]
+    for x in (250, 390):
+        canvas[180 - n // 2:180 - n // 2 + n, x - n // 2:x - n // 2 + n] = patch
+    monkeypatch.setattr(tracker.motion, 'update', lambda _: None)
+    monkeypatch.setattr(tracker_module, 'measure_channels', lambda *_args, **_kwargs: Measurement(False, 'few_valid'))
+    result = tracker.process(canvas, 24 / 30, 24)
+    assert result.state == 'LOST' and result.center_px is None
+    assert 'prediction_source' not in result.debug
+    tracker.close()
+
+
+def test_keyframe_prediction_rejects_conflict_with_valid_motion(monkeypatch):
+    import ringdet.tracker as tracker_module
+    from ringdet.motion import Motion
+    from ringdet.verify import Measurement
+    rng = np.random.default_rng(86)
+    image = synth.ground_texture(360, 640, rng)
+    synth.draw_ring(image, 320, 180, 18, 2, 75)
+    image = synth.degrade(image, rng)
+    tracker = RingTracker(Params(), Camera.default(640, 360))
+    tracker.set_click(320, 180)
+    for i in range(24):
+        result = tracker.process(image, i / 30, i)
+    assert result.state == 'DETECTED'
+    monkeypatch.setattr(tracker.motion, 'update', lambda _: Motion(np.float64([[1, 0, 0], [0, 1, 0]]), 80))
+    monkeypatch.setattr(tracker_module, 'measure_channels', lambda *_args, **_kwargs: Measurement(False, 'few_valid'))
+    shifted = cv2.warpAffine(image, np.float32([[1, 0, 12], [0, 1, 0]]), (640, 360))
+    result = tracker.process(shifted, 24 / 30, 24)
+    assert result.state == 'PREDICTED' and 'prediction_source' not in result.debug
+    assert math.dist(result.center_px, (320, 180)) < 1.5
+    tracker.close()
 
 
 def test_reacquire_same_ring_after_occlusion_with_decoy():
@@ -327,6 +455,51 @@ def test_identity_probation_keeps_valid_continuous_tracking(monkeypatch):
         np.testing.assert_array_equal(ref['image'], original)
 
 
+@pytest.mark.parametrize('recent_score', [.76, 1.0])
+def test_recent_identity_adapts_only_along_reliable_continuous_measurements(monkeypatch, recent_score):
+    from ringdet.motion import Motion
+    rng = np.random.default_rng(84)
+    image = synth.ground_texture(360, 640, rng)
+    synth.draw_ring(image, 320, 180, 18, 2, 75)
+    image = synth.degrade(image, rng)
+    tracker = RingTracker(Params(), Camera.default(640, 360))
+    tracker.set_click(320, 180)
+    for i in range(24):
+        result = tracker.process(image, i / 30, i)
+    assert result.state == 'DETECTED'
+    protected = tracker.references[0]['image'].copy()
+    original_score = tracker._reference_score
+
+    def score(fr, m, references=None):
+        return .7 if references is None else min(recent_score, original_score(fr, m, references))
+
+    monkeypatch.setattr(tracker, '_reference_score', score)
+    monkeypatch.setattr(tracker.motion, 'update', lambda _: Motion(np.float64([[1, 0, 2], [0, 1, 0]]), 80))
+    for i in range(24, 34):
+        dx = 2 * (i - 23)
+        moved = cv2.warpAffine(image, np.float32([[1, 0, dx], [0, 1, 0]]), (640, 360))
+        result = tracker.process(moved, i / 30, i)
+        assert result.state == 'DETECTED'
+        assert math.dist(result.center_px, (320 + dx, 180)) < 1.5
+    assert tracker.keyframe['stamp'] >= 33 / 30
+    if recent_score >= .9:
+        assert tracker.references[-1]['stamp'] >= 31 / 30
+    else:
+        assert tracker.references[-1]['stamp'] < 24 / 30
+    np.testing.assert_array_equal(tracker.references[0]['image'], protected)
+    from ringdet.frame import Frame
+    stamp = tracker.keyframe['stamp']
+    tracker._stamp += 1 / 30
+    tracker.dbg['measurement_shift'] = 10
+    tracker._remember(Frame(moved, 2), tracker.tgt_meas)
+    assert tracker.keyframe['stamp'] == stamp
+    tracker._stamp = stamp + tracker.P.track.coast_s + .01
+    tracker.dbg['measurement_shift'] = 0
+    tracker._remember(Frame(moved, 2), tracker.tgt_meas)
+    assert tracker.keyframe['stamp'] == stamp
+    tracker.close()
+
+
 def test_recovery_uses_trusted_scale_after_weak_radius_shrink(monkeypatch):
     rng = np.random.default_rng(67)
     image = synth.ground_texture(360, 640, rng)
@@ -412,17 +585,53 @@ def test_pending_recovery_cannot_bypass_confirmation(monkeypatch):
     image = synth.degrade(image, rng)
     tracker = RingTracker(Params(), Camera.default(640, 360))
     tracker.set_click(320, 180)
-    for i in range(12):
+    for i in range(24):
         result = tracker.process(image, i / 30, i)
     assert result.state == 'DETECTED'
     monkeypatch.setattr(tracker.motion, 'update', lambda _: None)
     shifted = cv2.warpAffine(image, np.float32([[1, 0, 70], [0, 1, 0]]), (640, 360))
-    for i in range(12, 14):
+    for i in range(24, 26):
         result = tracker.process(shifted, i / 30, i)
         assert result.state == 'LOST' and result.phase == 'COAST'
-    result = tracker.process(shifted, 14 / 30, 14)
+    result = tracker.process(shifted, 26 / 30, 26)
     assert result.state == 'DETECTED' and result.target_id == 1
     assert math.dist(result.center_px, (390, 180)) < 1.5
+
+
+@pytest.mark.parametrize('seeded', [False, True])
+def test_reacquire_rechecks_motion_prediction_without_waiting_for_template(monkeypatch, seeded):
+    from ringdet.motion import Motion
+    rng = np.random.default_rng(87)
+    image = synth.ground_texture(360, 640, rng)
+    synth.draw_ring(image, 320, 180, 18, 2, 75)
+    image = synth.degrade(image, rng)
+    tracker = RingTracker(Params(), Camera.default(640, 360))
+    tracker.set_click(320, 180)
+    for i in range(24):
+        result = tracker.process(image, i / 30, i)
+    assert result.state == 'DETECTED'
+    protected = tracker.references[0]['image'].copy()
+    tracker.phase = 'REACQUIRE'
+    tracker.reacq = dict(start=24 / 30, x=320., y=180., r=18.)
+    tracker.template_hold = tracker.P.track.template_update_hits
+    if seeded:
+        from ringdet.tracker import _Cand
+        candidate = _Cand(tracker.tgt_meas, 24 / 30, 5)
+        candidate.needed, candidate.frame = 3, tracker.n_frames
+        tracker.cands = [candidate]
+    monkeypatch.setattr(tracker.motion, 'update', lambda _: Motion(np.float64([[1, 0, 0], [0, 1, 0]]), 80))
+
+    def unexpected_template(*_):
+        raise AssertionError('可靠预测附近的圆应直接复查几何')
+
+    monkeypatch.setattr(tracker, '_template_measure', unexpected_template)
+    last = 25 if seeded else 26
+    for i in range(24, last + 1):
+        result = tracker.process(image, i / 30, i)
+        assert result.state == ('DETECTED' if i == last else 'LOST')
+    assert result.target_id == 1 and math.dist(result.center_px, (320, 180)) < 1.5
+    np.testing.assert_array_equal(tracker.references[0]['image'], protected)
+    tracker.close()
 
 
 def test_equal_identity_candidates_remain_ambiguous(monkeypatch):

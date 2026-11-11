@@ -52,6 +52,8 @@ def draw_result(frame, res):
         cross(img, x, y, max(4, res.radius_px * 0.3), color)
     color = {'DETECTED': GREEN, 'PREDICTED': ORANGE}.get(res.state, RED)
     s = f'#{res.frame_id}  {res.state} / {res.phase}  ID={res.target_id}'
+    if d.get('prediction_source') == 'appearance':
+        s += '  KEYFRAME'
     if res.ambiguous:
         s += '  AMBIGUOUS'
     lines = [(s, color)]
@@ -81,8 +83,9 @@ def draw_result(frame, res):
     score = d.get('target_identity_score') if res.state == 'DETECTED' else d.get('identity_score')
     identity = f'{score:.2f}' if score is not None else '--'
     label = 'Identity' if res.state == 'DETECTED' else 'Last ID check'
-    ncc = f"{d['template_score']:.2f}" if 'template_score' in d else '--'
-    psr = d.get('online_psr', d.get('online_update_psr'))
+    match = d.get('appearance_ncc', d.get('template_score'))
+    ncc = f'{match:.2f}' if match is not None else '--'
+    psr = d.get('appearance_psr', d.get('online_psr', d.get('online_update_psr')))
     psr = f'{psr:.1f}' if psr is not None else '--'
     lines.append((f"{label}: {identity}  NCC: {ncc}  PSR: {psr}  Refs: {d.get('reference_count', 0)}",
                   (255, 255, 255)))
