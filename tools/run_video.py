@@ -80,6 +80,7 @@ def main():
     paused = False
     frame = None
     next_display = time.perf_counter()
+    stats_start, stats_count, measured_fps = next_display, 0, 0.0
     while True:
         if not paused or frame is None:
             ok, frame = cap.read()
@@ -92,6 +93,13 @@ def main():
             pending.clear()
             stamp = a.start + i / fps
             res = trk.process(frame, stamp, i)
+            stats_count += 1
+            now = time.perf_counter()
+            if now - stats_start >= 1:
+                measured_fps = stats_count / (now - stats_start)
+                stats_start, stats_count = now, 0
+            res.debug['fps'] = measured_fps
+            res.debug['source_fps'] = fps
             counts[res.state] += 1
             ms.append(res.debug['ms'])
             if res.state == 'DETECTED' and first is None:
@@ -118,6 +126,7 @@ def main():
             if k == ord(' '):
                 paused = not paused
                 next_display = time.perf_counter()
+                stats_start, stats_count, measured_fps = next_display, 0, 0.0
             if k == ord('r'):
                 trk.reset()
     writer.release()

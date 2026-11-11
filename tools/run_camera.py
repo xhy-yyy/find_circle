@@ -339,6 +339,7 @@ def main():
                           f'算法 P95 {p95:.1f} ms，帧龄 {d["frame_age_ms"]:.1f} ms', file=sys.stderr)
                 stats_start, stats_count, stats_skipped, stats_ms = time.monotonic(), 0, 0, []
             res.debug['fps'] = measured_fps
+            res.debug['frame_age_ms'] = d['frame_age_ms']
             if a.show:
                 display_time = time.monotonic()
                 if display_time - last_display >= 1 / a.display_fps:

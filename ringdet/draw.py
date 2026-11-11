@@ -39,12 +39,8 @@ def draw_result(frame, res):
     d = res.debug
     if d.get('region') is not None:
         x0, y0, x1, y1 = d['region']
-        cv2.rectangle(img, (int(x0), int(y0)), (int(x1) - 1, int(y1) - 1), YELLOW, 1)
-    for x, y, r in d.get('found', []):
-        circle(img, x, y, r, GRAY)
-    for x, y, r, h in d.get('cands', []):
-        circle(img, x, y, r + 3, CYAN)
-        text(img, str(h), (int(x + r + 4), int(y)), CYAN, 0.45)
+        if x1 > x0 and y1 > y0:
+            cv2.rectangle(img, (int(x0), int(y0)), (int(x1) - 1, int(y1) - 1), YELLOW, 1)
     if res.center_px is not None:
         x, y = res.center_px
         color = GREEN if res.state == 'DETECTED' else ORANGE
@@ -55,16 +51,83 @@ def draw_result(frame, res):
             circle(img, x, y, res.radius_px, color)
         cross(img, x, y, max(4, res.radius_px * 0.3), color)
     color = {'DETECTED': GREEN, 'PREDICTED': ORANGE}.get(res.state, RED)
-    s = f'#{res.frame_id} {res.state} {res.phase} id={res.target_id}'
-    if res.center_px is not None:
-        s += f' c=({res.center_px[0]:.1f},{res.center_px[1]:.1f}) r={res.radius_px:.1f}'
+    s = f'#{res.frame_id}  {res.state} / {res.phase}  ID={res.target_id}'
     if res.ambiguous:
-        s += ' AMBIGUOUS'
-    text(img, s, (10, 25), color)
-    timing = f"{d.get('ms', 0):.0f} ms  noise={d.get('noise', 0):.1f}  flow={d.get('motion_inliers', 0)}"
-    if d.get('fps', 0) > 0:
-        timing += f"  {d['fps']:.1f} FPS"
-    if d.get('online_active'):
-        timing += f"  online={d.get('online_updates', 0)}"
-    text(img, timing, (10, 50))
+        s += '  AMBIGUOUS'
+    lines = [(s, color)]
+    if res.center_px is not None:
+        position = f'Center: ({res.center_px[0]:.1f}, {res.center_px[1]:.1f})  R: {res.radius_px:.1f}px'
+    else:
+        position = 'Center: --  R: --'
+    if res.age_ms is not None:
+        position += f'  Last seen: {res.age_ms:.0f}ms'
+    lines.append((position, (255, 255, 255)))
+    fps = f"{d['fps']:.1f}" if d.get('fps', 0) > 0 else '--'
+    timing = f"Process FPS: {fps}  Core: {d.get('ms', 0):.1f}ms"
+    if 'frame_age_ms' in d:
+        timing += f"  Frame age: {d['frame_age_ms']:.0f}ms"
+    elif 'source_fps' in d:
+        timing += f"  Video: {d['source_fps']:.1f}fps"
+    lines.append((timing, (255, 255, 255)))
+    if res.state == 'DETECTED':
+        geometry = (f"Geometry: sectors={res.sectors}/{d.get('verify_sectors', 16)}"
+                    f'  RMS={res.rms_px:.2f}px  Width={res.line_w_px:.1f}px')
+        lines.append((geometry, (255, 255, 255)))
+    flow = 'OK' if res.motion_ok else 'FAIL'
+    scope = 'local' if d.get('local_motion') else 'global'
+    lines.append((f"Flow: {flow} {scope}/{d.get('motion_backend', '--')}"
+                  f"  Inliers={d.get('motion_inliers', 0)}  Err={d.get('motion_error', 0):.1f}px",
+                  (255, 255, 255) if res.motion_ok else ORANGE))
+    score = d.get('target_identity_score') if res.state == 'DETECTED' else d.get('identity_score')
+    identity = f'{score:.2f}' if score is not None else '--'
+    label = 'Identity' if res.state == 'DETECTED' else 'Last ID check'
+    ncc = f"{d['template_score']:.2f}" if 'template_score' in d else '--'
+    psr = d.get('online_psr', d.get('online_update_psr'))
+    psr = f'{psr:.1f}' if psr is not None else '--'
+    lines.append((f"{label}: {identity}  NCC: {ncc}  PSR: {psr}  Refs: {d.get('reference_count', 0)}",
+                  (255, 255, 255)))
+    age = d.get('online_age_frames')
+    if not d.get('online_enabled'):
+        learning = 'OFF'
+    elif d.get('online_active'):
+        learning = 'UPDATED' if age == 0 else 'FROZEN' if res.phase != 'TRACK' or d.get('template_hold') else 'READY'
+    elif not d.get('reference_count'):
+        learning = 'WAIT LOCK'
+    elif res.radius_px is not None and res.radius_px < d.get('online_min_radius', 8):
+        learning = 'WAIT SIZE'
+    else:
+        learning = 'WAIT QUALITY'
+    lines.append((f"Online CF: {learning}  Updates={d.get('online_updates', 0)}"
+                  f"  Age={str(age) + 'f' if age is not None else '--'}  Hold={d.get('template_hold', 0)}",
+                  (255, 255, 255)))
+    if res.phase in ('SEARCH', 'REACQUIRE'):
+        search = f"Search: raw={len(d.get('found', []))}  candidates={len(d.get('cands', []))}"
+        confirmation = d.get('confirmation')
+        if confirmation is not None:
+            hits, needed, ed = confirmation
+            search += f"  Confirm={hits}/{needed}  ED={'yes' if ed else 'no'}"
+        if d.get('r_range') is not None:
+            lo, hi = d['r_range']
+            search += f'  R={lo:.1f}..{hi:.1f}'
+        lines.append((search, YELLOW))
+    check = d.get('track_meas')
+    if res.ambiguous:
+        lines.append(('Check: multiple similar candidates', ORANGE))
+    elif check is not None and not check.ok:
+        lines.append((f'Track check: {check.reason}', ORANGE))
+    elif d.get('rejected'):
+        reason = max(d['rejected'], key=d['rejected'].get)
+        lines.append((f'Search check: {reason}', ORANGE))
+    elif res.phase == 'SEARCH' and res.click_px is None and not d.get('reference_count'):
+        lines.append(('Waiting for click', YELLOW))
+    H, W = img.shape[:2]
+    scale = max(0.6, W / 1280)
+    font = 0.48 * scale
+    margin, gap = int(round(10 * scale)), int(round(21 * scale))
+    widths = [cv2.getTextSize(s, cv2.FONT_HERSHEY_SIMPLEX, font, 1)[0][0] for s, _ in lines]
+    panel_w, panel_h = min(W, max(widths) + 2 * margin), min(H, len(lines) * gap + margin)
+    panel = img[:panel_h, :panel_w]
+    cv2.addWeighted(panel, 0.35, panel * 0, 0.65, 0, dst=panel)
+    for row, (s, tint) in enumerate(lines):
+        text(img, s, (margin, margin + (row + 1) * gap - int(5 * scale)), tint, font)
     return img

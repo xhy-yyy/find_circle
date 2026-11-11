@@ -267,6 +267,20 @@ class RingTracker:
         self.dbg['template_backend'] = self.template_backend
         self.dbg['online_active'] = self.P.track.online_learning and self.online is not None
         self.dbg['online_updates'] = 0 if self.online is None else self.online['updates']
+        self.dbg['online_enabled'] = self.P.track.online_learning
+        self.dbg['online_min_radius'] = self.P.track.online_min_radius
+        self.dbg['online_age_frames'] = None if self.online is None else self.n_frames - self.online['frame']
+        self.dbg['template_hold'] = self.template_hold
+        self.dbg['reference_count'] = len(self.references)
+        self.dbg['verify_sectors'] = self.P.verify.sectors
+        c = self.recovery_candidate
+        if c is not None and c.frame == self.n_frames:
+            self.dbg['confirmation'] = (len(c.hits), c.needed, bool(c.ed_hits))
+        elif self.cands:
+            current = [c for c in self.cands if c.last_pass == stamp]
+            if current:
+                c = max(current, key=lambda c: (bool(c.ed_hits) if self.phase == SEARCH else True, sum(c.hits)))
+                self.dbg['confirmation'] = (int(sum(c.hits)), c.needed, bool(c.ed_hits))
         self.dbg['cands'] = [(c.cx, c.cy, c.r, int(sum(c.hits))) for c in self.cands]
         self.dbg['ms'] = (time.perf_counter() - t0) * 1000
         return self._result(frame_id, stamp)
@@ -366,6 +380,7 @@ class RingTracker:
                 history['width_var'] = (1 - alpha) * (history['width_var'] + alpha * error ** 2)
                 history.update(observation=observation, stamp=self._stamp, frame_stamp=self._stamp)
         score = self._reference_score(fr, m)
+        self.dbg['target_identity_score'] = score
         if self.template_hold or score < TP.identity_score:
             return
         half = max(8, int(math.ceil(2.5 * m.r)))
@@ -669,6 +684,7 @@ class RingTracker:
         return len(c.hits) >= c.needed
 
     def _accept_recovery(self, m, stamp):
+        self.dbg['target_identity_score'] = m.identity_score
         self.phase = TRACK
         self.tgt = [m.cx, m.cy, m.r]
         self.tgt_meas = m
