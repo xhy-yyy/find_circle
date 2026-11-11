@@ -138,6 +138,8 @@ class RingTracker:
         self.references = []
         self.reference_radius = None
         self.identity_hits = 0
+        self.stable_track_hits = 0
+        self.coast_motion_lost = False
         self.template_hold = 0
         self.recovery_candidate = None
         self.pending = []
@@ -339,6 +341,8 @@ class RingTracker:
         self.references = []
         self.reference_radius = None
         self.identity_hits = 0
+        self.stable_track_hits = 0
+        self.coast_motion_lost = False
         self.template_hold = 0
         self.recovery_candidate = None
         self.pending = []
@@ -678,6 +682,7 @@ class RingTracker:
         else:
             c.hits.append(True)
             c.cx, c.cy, c.r = m.cx, m.cy, m.r
+            c.meas = m
             c.needed = max(c.needed, needed)
         c.frame = self.n_frames
         self.dbg['reacq_hits'] = len(c.hits)
@@ -686,6 +691,8 @@ class RingTracker:
     def _accept_recovery(self, m, stamp):
         self.dbg['target_identity_score'] = m.identity_score
         self.phase = TRACK
+        self.stable_track_hits = 0
+        self.coast_motion_lost = False
         self.tgt = [m.cx, m.cy, m.r]
         self.tgt_meas = m
         self.last_detect = stamp
@@ -730,6 +737,12 @@ class RingTracker:
             return None
         cx, cy, r = self.tgt
         TP, V = self.P.track, self.P.verify
+        c = self.recovery_candidate
+        if (c is not None and c.frame == self.n_frames - 1
+                and (self.coast_motion_lost or self.phase == REACQUIRE)
+                and c.meas.identity_score >= 0.9 and c.meas.sectors >= V.lock_sectors
+                and c.meas.inlier_ratio >= V.lock_min_inlier_ratio):
+            cx, cy, r = c.cx, c.cy, c.r
         # 弱测量可能缩小半径，重捕保留随地面运动传播的可靠尺度。
         r = max(r, self.reference_radius or r)
         age = max(0.0, stamp - self.last_detect)
@@ -829,6 +842,8 @@ class RingTracker:
         self._stamp = stamp
         cx, cy, r = self.tgt
         since = stamp - self.last_detect
+        stable_grace = (self.stable_track_hits >= TP.stable_track_frames
+                        and 0 < since <= TP.stable_no_flow_s)
         if T is None:
             delta = _delta(V.delta_search, r)
         elif self.phase == COAST:
@@ -838,8 +853,10 @@ class RingTracker:
         m = measure_channels(fr, self.cam, cx, cy, r, V, 'track', delta, local=True)
         self._recover_shift(fr, m, cx, cy, r)
         self.dbg['track_meas'] = m
-        if not m.ok:
-            recovered = self._template_measure(fr, stamp)
+        if not m.ok or self.coast_motion_lost:
+            recovered = m if m.ok and self._recovery_identity(fr, m) else None
+            if recovered is None:
+                recovered = self._template_measure(fr, stamp)
             if recovered is not None:
                 strong = (recovered.identity_score >= 0.9
                           and recovered.sectors >= V.lock_sectors
@@ -847,14 +864,19 @@ class RingTracker:
                           and math.hypot(recovered.cx - cx, recovered.cy - cy) <= max(24, 3 * r))
                 if strong or self._confirm_recovery(recovered, stamp):
                     self._accept_recovery(recovered, stamp)
+                elif stable_grace and (T is None or self.coast_motion_lost):
+                    self.phase = COAST
+                    self.coast_motion_lost = True
                 else:
                     self.phase = REACQUIRE
+                    self.coast_motion_lost = False
+                    self.stable_track_hits = 0
                     if self.reacq is None:
                         self.reacq = dict(start=stamp, x=cx, y=cy, r=r)
                     self.out = LOST
                 return
             self.recovery_candidate = None
-        if m.ok:
+        if m.ok and not self.coast_motion_lost:
             self.phase = TRACK
             self.tgt = [m.cx, m.cy, m.r]
             self.tgt_meas = m
@@ -869,8 +891,19 @@ class RingTracker:
                 if self.template_hold and self._recovery_identity(fr, m):
                     self.template_hold -= 1
             self._remember(fr, m)
-        elif T is None or since > TP.coast_s:
+            if self.template_hold or self.dbg.get('target_identity_score', -1) < TP.identity_score:
+                self.stable_track_hits = 0
+            elif m.sectors >= V.lock_sectors and m.inlier_ratio >= V.lock_min_inlier_ratio:
+                self.stable_track_hits = min(self.stable_track_hits + 1, TP.stable_track_frames + 2)
+            else:
+                self.stable_track_hits = max(0, self.stable_track_hits - 1)
+        elif (T is None or self.coast_motion_lost) and stable_grace:
+            self.phase = COAST
+            self.coast_motion_lost = True
+        elif T is None or self.coast_motion_lost or since > TP.coast_s:
             self.phase = REACQUIRE
+            self.coast_motion_lost = False
+            self.stable_track_hits = 0
             self.reacq = dict(start=stamp, x=cx, y=cy, r=r)
             self.cands = []
             self.cursor = 0

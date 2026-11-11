@@ -130,6 +130,8 @@ class TrackParams:
     max_verify: int = 40         # 每帧最多复核多少个新候选
     cand_timeout_s: float = 1.0  # 候选这么久没通过就丢弃
     coast_s: float = 0.3
+    stable_track_frames: int = 6
+    stable_no_flow_s: float = 0.12
     reacq_box_r: float = 6.0     # 重捕框边长 = 6r
     reacq_box_min: float = 240.0  # 小环重捕框的最小边长（原图 px）
     reacq_radius: float = 0.25   # 重捕半径范围 ±25%

@@ -152,6 +152,114 @@ def test_template_recovers_jump_when_optical_flow_fails(monkeypatch, dx, dy):
     assert math.dist(result.center_px, (320 + dx, 180 + dy)) < 1.5
 
 
+def test_stable_track_waits_through_brief_blur_without_outputting_a_position(monkeypatch):
+    rng = np.random.default_rng(57)
+    image = synth.ground_texture(360, 640, rng)
+    synth.draw_ring(image, 320, 180, 18, 2, 75)
+    image = synth.degrade(image, rng)
+    tracker = RingTracker(Params(), Camera.default(640, 360))
+    tracker.set_click(320, 180)
+    for i in range(24):
+        result = tracker.process(image, i / 30, i)
+    assert result.state == 'DETECTED'
+    assert tracker.stable_track_hits >= tracker.P.track.stable_track_frames
+    reference = tracker.references[0]['image'].copy()
+    online_updates = tracker.online['updates']
+    monkeypatch.setattr(tracker.motion, 'update', lambda _: None)
+    blurred = cv2.GaussianBlur(image, (0, 0), 16)
+    for i in range(24, 26):
+        result = tracker.process(blurred, i / 30, i)
+        assert result.state == 'LOST' and result.phase == 'COAST'
+        assert result.center_px is None and not result.motion_ok
+        np.testing.assert_array_equal(tracker.references[0]['image'], reference)
+        assert tracker.online['updates'] == online_updates
+    result = tracker.process(image, 26 / 30, 26)
+    assert result.state == 'DETECTED' and result.target_id == 1
+    assert math.dist(result.center_px, (320, 180)) < 1.5
+    tracker.close()
+
+
+def test_broken_motion_chain_requires_identity_and_expires(monkeypatch):
+    from ringdet.motion import Motion
+    rng = np.random.default_rng(35)
+    image = synth.ground_texture(360, 640, rng)
+    synth.draw_ring(image, 320, 180, 18, 2, 75)
+    image = synth.degrade(image, rng)
+    tracker = RingTracker(Params(), Camera.default(640, 360))
+    tracker.set_click(320, 180)
+    for i in range(24):
+        result = tracker.process(image, i / 30, i)
+    assert result.state == 'DETECTED' and tracker.stable_track_hits >= 6
+    monkeypatch.setattr(tracker.motion, 'update', lambda _: None)
+    monkeypatch.setattr(tracker, '_template_measure', lambda *_: None)
+    blurred = cv2.GaussianBlur(image, (0, 0), 16)
+    result = tracker.process(blurred, 24 / 30, 24)
+    assert result.state == 'LOST' and result.phase == 'COAST'
+    foreign = synth.ground_texture(360, 640, np.random.default_rng(36))
+    synth.draw_ring(foreign, 320, 180, 18, 2, 75)
+    foreign = synth.degrade(foreign, rng)
+    monkeypatch.setattr(tracker.motion, 'update', lambda _: Motion(np.float64([[1, 0, 0], [0, 1, 0]]), 80))
+    result = tracker.process(foreign, 25 / 30, 25)
+    assert result.debug['track_meas'].ok
+    assert result.state == 'LOST' and result.center_px is None
+    result = tracker.process(blurred, 27 / 30, 27)
+    assert result.state == 'LOST' and result.phase == 'REACQUIRE'
+    tracker.close()
+
+
+def test_recovery_candidate_guides_search_after_large_jitter(monkeypatch):
+    rng = np.random.default_rng(58)
+    image = synth.ground_texture(360, 640, rng)
+    synth.draw_ring(image, 250, 180, 18, 2, 75)
+    image = synth.degrade(image, rng)
+    tracker = RingTracker(Params(), Camera.default(640, 360))
+    tracker.set_click(250, 180)
+    for i in range(24):
+        result = tracker.process(image, i / 30, i)
+    assert result.state == 'DETECTED' and tracker.stable_track_hits >= 6
+    monkeypatch.setattr(tracker.motion, 'update', lambda _: None)
+    for i, dx in enumerate((80, 150, 150, 150), 24):
+        shifted = cv2.warpAffine(image, np.float32([[1, 0, dx], [0, 1, 0]]), (640, 360))
+        result = tracker.process(shifted, i / 30, i)
+        if i < 27:
+            assert result.state == 'LOST'
+    assert result.state == 'DETECTED' and result.target_id == 1
+    assert math.dist(result.center_px, (400, 180)) < 1.5
+    tracker.close()
+
+
+def test_stability_survives_two_weaker_measurements(monkeypatch):
+    import ringdet.tracker as tracker_module
+    rng = np.random.default_rng(59)
+    image = synth.ground_texture(360, 640, rng)
+    synth.draw_ring(image, 320, 180, 18, 2, 75)
+    image = synth.degrade(image, rng)
+    tracker = RingTracker(Params(), Camera.default(640, 360))
+    tracker.set_click(320, 180)
+    for i in range(24):
+        result = tracker.process(image, i / 30, i)
+    assert result.state == 'DETECTED' and tracker.stable_track_hits >= 8
+    measure = tracker_module.measure_channels
+    remaining = [2]
+
+    def weaker(*args, **kwargs):
+        m = measure(*args, **kwargs)
+        if remaining[0] and args[6] == 'track' and m.ok:
+            m.sectors = 12
+            remaining[0] -= 1
+        return m
+
+    monkeypatch.setattr(tracker_module, 'measure_channels', weaker)
+    for i in range(24, 26):
+        assert tracker.process(image, i / 30, i).state == 'DETECTED'
+    assert tracker.stable_track_hits >= tracker.P.track.stable_track_frames
+    monkeypatch.setattr(tracker.motion, 'update', lambda _: None)
+    blurred = cv2.GaussianBlur(image, (0, 0), 16)
+    result = tracker.process(blurred, 26 / 30, 26)
+    assert result.state == 'LOST' and result.phase == 'COAST' and result.center_px is None
+    tracker.close()
+
+
 def test_foreign_circle_cannot_replace_trusted_identity(monkeypatch):
     rng = np.random.default_rng(35)
     background = synth.ground_texture(360, 640, rng)
@@ -168,6 +276,7 @@ def test_foreign_circle_cannot_replace_trusted_identity(monkeypatch):
     assert tracker.online is not None
     online = tracker.online['spectrum'].copy()
     reference_count = len(tracker.references)
+    tracker.P.track.stable_no_flow_s = 0
     monkeypatch.setattr(tracker.motion, 'update', lambda _: None)
     tracker.process(np.zeros((360, 640), dtype=np.uint8), 11.5 / 30, 12)
     assert tracker.phase == 'REACQUIRE'
@@ -310,7 +419,7 @@ def test_pending_recovery_cannot_bypass_confirmation(monkeypatch):
     shifted = cv2.warpAffine(image, np.float32([[1, 0, 70], [0, 1, 0]]), (640, 360))
     for i in range(12, 14):
         result = tracker.process(shifted, i / 30, i)
-        assert result.state == 'LOST' and result.phase == 'REACQUIRE'
+        assert result.state == 'LOST' and result.phase == 'COAST'
     result = tracker.process(shifted, 14 / 30, 14)
     assert result.state == 'DETECTED' and result.target_id == 1
     assert math.dist(result.center_px, (390, 180)) < 1.5
@@ -329,6 +438,7 @@ def test_equal_identity_candidates_remain_ambiguous(monkeypatch):
     for i in range(12):
         result = tracker.process(image, i / 30, i)
     assert result.state == 'DETECTED' and tracker.references
+    tracker.P.track.stable_no_flow_s = 0
     monkeypatch.setattr(tracker.motion, 'update', lambda _: None)
     tracker.process(np.zeros((360, 640), dtype=np.uint8), 11.5 / 30, 12)
     assert tracker.phase == 'REACQUIRE'

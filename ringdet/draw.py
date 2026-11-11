@@ -37,7 +37,7 @@ def draw_measurement(img, m, color):
 def draw_result(frame, res):
     img = frame.copy() if frame.ndim == 3 else cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
     d = res.debug
-    if d.get('region') is not None:
+    if res.phase == 'SEARCH' and res.click_px is not None and d.get('region') is not None:
         x0, y0, x1, y1 = d['region']
         if x1 > x0 and y1 > y0:
             cv2.rectangle(img, (int(x0), int(y0)), (int(x1) - 1, int(y1) - 1), YELLOW, 1)
