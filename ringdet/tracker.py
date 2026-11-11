@@ -688,6 +688,9 @@ class RingTracker:
             self.last_detect = stamp
             self.out = DETECTED
             if m.sectors >= V.lock_sectors and m.inlier_ratio >= V.lock_min_inlier_ratio:
+                # 几何测量校正尺度，外观参考仍受身份验证约束。
+                if self.references:
+                    self.reference_radius = m.r
                 self.identity_hits += 1
                 # 身份复核只限制参考更新，不打断已通过的连续测量。
                 if self.template_hold and self._recovery_identity(fr, m):

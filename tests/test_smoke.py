@@ -235,6 +235,40 @@ def test_recovery_uses_trusted_scale_after_weak_radius_shrink(monkeypatch):
     tracker.close()
 
 
+def test_frozen_appearance_does_not_accumulate_scale_drift(monkeypatch):
+    from ringdet.motion import Motion
+    rng = np.random.default_rng(68)
+    image = synth.ground_texture(360, 640, rng)
+    synth.draw_ring(image, 320, 180, 18, 2, 75)
+    image = synth.degrade(image, rng)
+    tracker = RingTracker(Params(), Camera.default(640, 360))
+    tracker.set_click(320, 180)
+    try:
+        for i in range(12):
+            result = tracker.process(image, i / 30, i)
+        assert result.state == 'DETECTED'
+        references = [ref['image'].copy() for ref in tracker.references]
+        score = tracker._reference_score
+        monkeypatch.setattr(tracker, '_reference_score', lambda *_: .7)
+        transform = Motion(np.array([[1.01, 0., -3.2], [0., 1.01, -1.8]]), 80)
+        monkeypatch.setattr(tracker.motion, 'update', lambda _: transform)
+        for i in range(12, 52):
+            result = tracker.process(image, i / 30, i)
+            assert result.state == 'DETECTED'
+        assert abs(tracker.reference_radius - 18) < 1
+        for ref, original in zip(tracker.references, references):
+            np.testing.assert_array_equal(ref['image'], original)
+        monkeypatch.setattr(tracker, '_reference_score', score)
+        monkeypatch.setattr(tracker.motion, 'update', lambda _: None)
+        shifted = cv2.warpAffine(image, np.float32([[1, 0, 70], [0, 1, 0]]), (640, 360))
+        for i in range(52, 55):
+            result = tracker.process(shifted, i / 30, i)
+        assert result.state == 'DETECTED' and result.target_id == 1
+        assert math.dist(result.center_px, (390, 180)) < 1.5
+    finally:
+        tracker.close()
+
+
 def test_expensive_template_cannot_starve_search_or_timeout(monkeypatch):
     tracker = RingTracker(Params(), Camera.default(320, 180))
     tracker.phase = 'REACQUIRE'
