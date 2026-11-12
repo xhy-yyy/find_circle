@@ -236,12 +236,15 @@ def test_keyframe_prediction_rejects_conflict_with_valid_motion(monkeypatch):
     tracker.close()
 
 
-def test_reacquire_same_ring_after_occlusion_with_decoy():
+@pytest.mark.parametrize('stagger_scales', [False, True])
+def test_reacquire_same_ring_after_occlusion_with_decoy(stagger_scales):
     hidden = set(range(15, 36))
     frames, gts = synth.descent(np.random.default_rng(17), n=55, size=(640, 360),
                                r0=12, r1=16, contrast=65, drift=(1.2, 0.2),
                                jitter=1.2, rot_deg=0.8, hide=hidden, distractors=False)
-    tracker = RingTracker(Params(), Camera.default(640, 360))
+    params = Params()
+    params.track.stagger_recovery_scales = stagger_scales
+    tracker = RingTracker(params, Camera.default(640, 360))
     tracker.set_click(gts[0][0], gts[0][1])
     results = []
     for i, (frame, gt) in enumerate(zip(frames, gts)):
@@ -278,6 +281,39 @@ def test_template_recovers_jump_when_optical_flow_fails(monkeypatch, dx, dy):
     assert result.state == 'DETECTED'
     assert result.target_id == target_id
     assert math.dist(result.center_px, (320 + dx, 180 + dy)) < 1.5
+
+
+def test_async_template_rechecks_current_frames_after_motion_failure(monkeypatch):
+    rng = np.random.default_rng(24)
+    image = synth.ground_texture(360, 640, rng)
+    synth.draw_ring(image, 320, 180, 14, 1.5, 70)
+    image = synth.degrade(image, rng)
+    params = Params()
+    params.track.online_learning = False
+    tracker = RingTracker(params, Camera.default(640, 360))
+    try:
+        tracker.set_click(320, 180)
+        for i in range(20):
+            result = tracker.process(image, i / 30, i)
+        assert result.state == 'DETECTED'
+        target_id = result.target_id
+        params.search.async_search = True
+        monkeypatch.setattr(tracker.motion, 'update', lambda _: None)
+        shifted = cv2.warpAffine(image, np.float32([[1, 0, 34], [0, 1, -12]]), (640, 360))
+        result = tracker.process(shifted, 20 / 30, 20)
+        assert result.state != 'DETECTED' and tracker._search_meta['kind'] == 'template'
+        assert tracker._search_future.result(timeout=2)
+        assert tracker.process(np.zeros_like(image), 21 / 30, 21).state != 'DETECTED'
+        for i in range(22, 32):
+            result = tracker.process(shifted, i / 30, i)
+            if tracker._search_future is not None:
+                tracker._search_future.result(timeout=2)
+            if result.state == 'DETECTED':
+                break
+        assert result.state == 'DETECTED' and result.target_id == target_id
+        assert math.dist(result.center_px, (354, 168)) < 1.5
+    finally:
+        tracker.close()
 
 
 def test_stable_track_waits_through_brief_blur_without_outputting_a_position(monkeypatch):
@@ -655,7 +691,7 @@ def test_pending_search_verifies_before_fft_even_after_budget(monkeypatch):
             result = tracker.process(image, i / 30, i)
             assert result.state == ('DETECTED' if i == params.track.identity_init_hits else 'LOST')
         assert result.center_px == (160., 90.)
-        assert calls == ['fft'] + ['verify'] * params.track.identity_init_hits
+        assert calls == ['fft'] + ['verify'] * (params.track.identity_init_hits + 1)
     finally:
         tracker.close()
 
@@ -680,8 +716,8 @@ def test_pending_recovery_cannot_bypass_confirmation(monkeypatch):
     assert math.dist(result.center_px, (390, 180)) < 1.5
 
 
-@pytest.mark.parametrize('seeded', [False, True])
-def test_reacquire_rechecks_motion_prediction_without_waiting_for_template(monkeypatch, seeded):
+@pytest.mark.parametrize('seeded,local', [(False, False), (True, False), (False, True)])
+def test_reacquire_rechecks_motion_prediction_without_waiting_for_template(monkeypatch, seeded, local):
     from ringdet.motion import Motion
     rng = np.random.default_rng(87)
     image = synth.ground_texture(360, 640, rng)
@@ -693,26 +729,70 @@ def test_reacquire_rechecks_motion_prediction_without_waiting_for_template(monke
         result = tracker.process(image, i / 30, i)
     assert result.state == 'DETECTED'
     protected = tracker.references[0]['image'].copy()
-    tracker.phase = 'REACQUIRE'
-    tracker.reacq = dict(start=24 / 30, x=320., y=180., r=18.)
-    tracker.template_hold = tracker.P.track.template_update_hits
+    if not local:
+        tracker.phase = 'REACQUIRE'
+        tracker.reacq = dict(start=24 / 30, x=320., y=180., r=18.)
+        tracker.template_hold = tracker.P.track.template_update_hits
     if seeded:
         from ringdet.tracker import _Cand
         candidate = _Cand(tracker.tgt_meas, 24 / 30, 5)
         candidate.needed, candidate.frame = 3, tracker.n_frames
         tracker.cands = [candidate]
     monkeypatch.setattr(tracker.motion, 'update', lambda _: Motion(np.float64([[1, 0, 0], [0, 1, 0]]), 80))
+    if local:
+        import ringdet.tracker as tracker_module
+        from ringdet.verify import Measurement
+
+        tracker.P.track.local_reacq_hits = 2
+        tracker.motion.local_ok, tracker.motion.error = True, .2
+
+        def verify(_fr, _cam, x, y, r, _params, mode, *_args, **_kwargs):
+            assert mode == ('track' if tracker.n_frames == 25 else 'local')
+            if tracker.n_frames < 29:
+                return Measurement(False, 'few_valid')
+            return Measurement(True, '', x, y, r, sectors=12, max_gap=3, inlier_ratio=.78, rms=.5, line_w=2.)
+
+        monkeypatch.setattr(tracker_module, 'measure_channels', verify)
 
     def unexpected_template(*_):
         raise AssertionError('可靠预测附近的圆应直接复查几何')
 
     monkeypatch.setattr(tracker, '_template_measure', unexpected_template)
-    last = 25 if seeded else 26
+    last = 29 if local else (25 if seeded else 26)
     for i in range(24, last + 1):
         result = tracker.process(image, i / 30, i)
-        assert result.state == ('DETECTED' if i == last else 'LOST')
+        assert result.state == ('DETECTED' if i == last else 'PREDICTED' if local else 'LOST')
+        if local and i < last:
+            assert result.phase == 'REACQUIRE' and result.debug['prediction_source'] == 'flow'
     assert result.target_id == 1 and math.dist(result.center_px, (320, 180)) < 1.5
     np.testing.assert_array_equal(tracker.references[0]['image'], protected)
+    tracker.close()
+
+
+@pytest.mark.parametrize('flow_lost', [False, True])
+def test_local_reacquire_falls_back_after_timeout_or_flow_loss(monkeypatch, flow_lost):
+    import ringdet.tracker as tracker_module
+    from ringdet.motion import Motion
+    from ringdet.verify import Measurement
+
+    params = Params()
+    params.track.local_reacq_hits = 2
+    tracker = RingTracker(params, Camera.default(320, 180))
+    tracker.tgt, tracker.last_detect = [160., 90., 12.], 0.
+    tracker._begin_reacquire(0., flow_only=True)
+    tracker.motion.local_ok, tracker.motion.error = True, .2
+    transform = Motion(np.float64([[1, 0, 0], [0, 1, 0]]), 80)
+    monkeypatch.setattr(tracker.motion, 'update', lambda _: None if flow_lost else transform)
+    monkeypatch.setattr(tracker_module, 'measure_channels', lambda *_a, **_kw: Measurement(False, 'few_valid'))
+    template_calls = []
+    monkeypatch.setattr(tracker, '_template_measure', lambda *_: template_calls.append(tracker.n_frames))
+    image = np.zeros((180, 320), np.uint8)
+    result = tracker.process(image, .1 if flow_lost else params.track.coast_s + .01)
+    assert result.state == 'LOST' and template_calls == [1]
+    if flow_lost:
+        monkeypatch.setattr(tracker.motion, 'update', lambda _: transform)
+        tracker.process(image, .15)
+        assert template_calls == [1, 2]
     tracker.close()
 
 
@@ -1014,8 +1094,8 @@ def test_first_confirmation_is_not_starved_by_regional_ed(monkeypatch):
     tracker.set_click(180, 120)
     monkeypatch.setattr(module, 'ed_support', lambda *_: tracker.n_frames >= 7)
     def occupied(*_):
-        tracker._ed_future = Future()
-        tracker._ed_meta = dict(valid=True, stamp=0., A=np.eye(3))
+        tracker._search_future = Future()
+        tracker._search_meta = dict(valid=True, stamp=0., A=np.eye(3))
         return True
     monkeypatch.setattr(tracker, '_submit_ed', occupied)
     try:
@@ -1035,8 +1115,8 @@ def test_async_ed_candidates_require_valid_current_coordinates(invalidate):
     tracker = RingTracker()
     tracker.dbg = {}
     future = Future()
-    tracker._ed_future = future
-    tracker._ed_meta = dict(valid=True, stamp=1.0,
+    tracker._search_future = future
+    tracker._search_meta = dict(valid=True, stamp=1.0,
                            A=np.array([[1., 0, 100], [0, 1., 200], [0, 0, 1.]]))
     tracker._propagate(Motion(np.array([[1.1, 0, 5], [0, 1.1, -2.]]), 80))
     if invalidate == 'motion':
@@ -1045,7 +1125,7 @@ def test_async_ed_candidates_require_valid_current_coordinates(invalidate):
         tracker.set_click(120, 120)
         tracker._apply_click(1.03)
     future.set_result([Candidate(10, 12, 6, 100, -1)])
-    found = tracker._poll_ed(1.4 if invalidate == 'age' else 1.03)
+    found = tracker._poll_search(1.4 if invalidate == 'age' else 1.03)
     if invalidate:
         assert not found
     else:
@@ -1312,9 +1392,15 @@ def test_nano_profile_preserves_detection_parameters():
     actual = asdict(Params.load(path))
     expected['track']['compact_gpu_matching'] = False
     expected['track']['stable_template_grace_s'] = .075
-    expected['track']['identity_every'] = 3
-    expected['track'].update(template_cuda_min_area=90000, recovery_local_s=.12, small_ring_geometry_hits=8)
-    expected['search'].update(radii_per_job=2, click_focus_half=240, click_focus_radii_per_job=6, verify_pending_first=True)
+    expected['track']['identity_every'] = 4
+    expected['track'].update(template_cuda_min_area=90000, recovery_local_s=.12, small_ring_geometry_hits=8,
+                             local_reacq_hits=2, stagger_recovery_scales=True,
+                             fast_measure_every=5, online_update_frames=6, identity_init_hits=4,
+                             reacq_weak_hits=3, reacq_giveup_s=6.0, lost_r_floor=.3)
+    expected['motion'].update(width=560, max_corners=160, refresh_ratio=.4)
+    expected['search'].update(budget_ms=48., radii_per_job=6, click_focus_half=240,
+                              click_focus_radii_per_job=6, verify_pending_first=True, async_search=False,
+                              escalate_s=1.5, click_max_levels=2)
     assert actual == expected
 
 
@@ -1386,6 +1472,44 @@ def test_cuda_compact_peaks_preserve_downloaded_response():
     assert peaks[0][1] == expected_point
     assert peaks[0][0] == pytest.approx(expected_score, abs=1e-5)
     tracker.close()
+
+
+@pytest.mark.parametrize('record', [False, True])
+def test_camera_skips_decoding_when_previous_frame_is_pending(monkeypatch, record):
+    from tools.run_camera import LatestFrame
+
+    retrieved, decoded, recorded = [], [], []
+
+    class CameraSource:
+        seq = 0
+
+        def grab(self):
+            self.seq += 1
+            if self.seq == 4:
+                assert grab.get()[2] == 1
+            if self.seq == 6:
+                grab.alive = False
+                return False
+            return True
+
+        def retrieve(self):
+            retrieved.append(self.seq)
+            return True, np.array([[self.seq]], np.uint8)
+
+    class Recorder:
+        def submit(self, packet):
+            recorded.append(packet[0])
+
+    def decode(packet, _):
+        decoded.append(int(packet[0, 0]))
+        return np.zeros((8, 8, 3), np.uint8)
+
+    monkeypatch.setattr(cv2, 'imdecode', decode)
+    grab = LatestFrame(CameraSource(), Recorder() if record else None)
+    grab.run()
+    assert grab.get()[2] == 4 and decoded == [1, 4]
+    assert retrieved == ([1, 2, 3, 4, 5] if record else [1, 4])
+    assert recorded == ([1, 2, 3, 4, 5] if record else [])
 
 
 def test_record_queue_does_not_block_vision(monkeypatch):

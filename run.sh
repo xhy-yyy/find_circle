@@ -6,7 +6,6 @@ cd "$(dirname "$(readlink -f "$0")")"
 # ---------------- 可修改的配置（也可以用同名环境变量覆盖，例如 DEV=/dev/video1 ./run.sh camera） ----------------
 DEV="${DEV:-/dev/video0}"              # 相机设备
 SIZE="${SIZE:-1920x1080}"              # 分辨率
-FPS="${FPS:-30}"
 CALIB="${CALIB:-}"                     # 相机标定 yaml（ROS camera_info 格式）；空 = 未标定
 EXPOSURE="${EXPOSURE:-keep}"           # keep = 保持相机控制项；auto = 自动曝光；数字单位 100 us
 UDP_OUT="${UDP_OUT:-}"                 # 结果发到哪里，如 192.168.1.10:9000；空 = 打印到屏幕
@@ -16,10 +15,14 @@ TARGET="${TARGET:-127.0.0.1}"          # click/height/reset 命令发往的视�
 TEST_IMAGES="${TEST_IMAGES:-$HOME/桌面/无人机下视圆环图片}"
 # ------------------------------------------------------------------------------------------------------------
 
-if [[ ! -v PARAMS && -f orin_nano_8gb.yaml && -r /proc/device-tree/model ]] &&
+if [[ -r /proc/device-tree/model ]] &&
    [[ $(tr -d '\000' </proc/device-tree/model) == *"Jetson Orin Nano"* ]]; then
-  PARAMS=orin_nano_8gb.yaml
+  FPS="${FPS:-60}"
+  if [[ ! -v PARAMS && -f orin_nano_8gb.yaml ]]; then
+    PARAMS=orin_nano_8gb.yaml
+  fi
 fi
+FPS="${FPS:-30}"
 PARAMS="${PARAMS:-}"                   # 显式置空使用通用参数
 if [[ -z "${PY:-}" && -x .venv-cuda/bin/python3 ]]; then
   PY="$PWD/.venv-cuda/bin/python3"

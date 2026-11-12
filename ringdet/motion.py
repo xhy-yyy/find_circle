@@ -137,7 +137,7 @@ class GroundMotion:
         H, W = gray_u8.shape
         s = min(1.0, P.width / W)
         small = gray_u8 if s >= 1.0 else cv2.resize(
-            gray_u8, (int(round(W * s)), int(round(H * s))), interpolation=cv2.INTER_AREA)
+            gray_u8, (int(round(W * s)), int(round(H * s))), interpolation=cv2.INTER_LINEAR)
         prev, self.prev = self.prev, small
         self.frames += 1
         self.last_inliers = 0
@@ -150,7 +150,7 @@ class GroundMotion:
             return None
         pts, n_global = self.points, self.n_global
         refresh = self.frames % max(1, P.refresh_frames) == 0
-        if pts is None or n_global < max(P.min_inliers, int(0.6 * P.max_corners)) or refresh:
+        if pts is None or n_global < max(P.min_inliers, int(P.refresh_ratio * P.max_corners)) or refresh:
             pts = self._corners(prev, P.max_corners, P.min_distance)
             n_global = 0 if pts is None else len(pts)
         if pts is None:

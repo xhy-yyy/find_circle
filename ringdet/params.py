@@ -64,6 +64,7 @@ class SearchParams:
     click_only: bool = True      # True：没点击就不搜索（输出 LOST）；False：没点击时全图搜索
     fft_cache_mb: float = 96.0    # 核频谱缓存上限
     async_ed: bool = True        # 区域 ED 在单个后台线程执行，结果在当前帧重新验证
+    async_search: bool = False  # FFT 和大范围模板匹配使用同一个后台搜索线程
     click_focus_r_max: float = 12.0  # 点击附近高频复查的小环半径上限
     click_focus_half: int = 0  # 0 = 使用 click_tile 作为局部搜索半边长
     click_focus_radii_per_job: int = 0  # 0 = 使用 radii_per_job
@@ -122,6 +123,7 @@ class MotionParams:
     min_cells: int = 4
     backend: str = 'auto'        # auto / cpu / cuda；auto 在 CUDA 不可用时回退 CPU
     refresh_frames: int = 8      # 角点定期补充，数量或局部覆盖不足时提前补充
+    refresh_ratio: float = 0.6   # 剩余角点少于 max_corners*它 时提前补充
 
 
 @dataclass
@@ -130,6 +132,7 @@ class TrackParams:
     confirm_hits: int = 3        # 至少 confirm_hits 帧通过，且当前帧通过
     identity_init_hits: int = 6
     small_ring_geometry_hits: int = 0  # 小圆未获 ED 支持时所需的连续强复核帧数
+    local_reacq_hits: int = 0      # 可靠局部光流内原目标重捕的连续复核帧数
     assoc: Tuple[float, float] = (3.0, 0.25)   # 同一候选：中心差 <= max(a, b*r)
     assoc_radius: float = 0.15   # 且半径差 <= 15%
     max_cands: int = 30
@@ -156,6 +159,7 @@ class TrackParams:
     template_score: float = 0.65  # 局部外观匹配通过后仍需几何复核
     identity_score: float = 0.8   # 重捕身份分；较弱结果还须严格几何与更长确认
     identity_every: int = 1       # 稳定跟踪时每 N 帧做一次身份比对；1 = 每帧
+    fast_measure_every: int = 0   # 稳定跟踪时每 N 帧做一次完整复核，其余帧走单遍快路径；0 = 关闭
     identity_margin: float = 0.06  # 两个重捕候选的身份分太接近时暂不接回
     reacq_confirm_hits: int = 3
     reacq_weak_hits: int = 5
@@ -165,6 +169,7 @@ class TrackParams:
     template_backend: str = 'auto'  # auto / cpu / cuda；CUDA 用于较大的重捕图块
     template_cuda_min_area: int = 0  # auto 模式使用 CUDA 的最小搜索面积（px²）
     recovery_local_s: float = 0.0    # 光流可靠时先在预测点附近重捕的时长
+    stagger_recovery_scales: bool = False  # 分帧搜索重捕尺度
     compact_gpu_matching: bool = True
     online_learning: bool = True   # 背景感知相关滤波，只产生重捕候选
     online_min_radius: float = 8.0  # 小于此像素半径保留原像素模板路径

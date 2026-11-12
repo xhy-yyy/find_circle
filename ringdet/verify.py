@@ -63,15 +63,16 @@ def _angles(n):
     return th, np.cos(th), np.sin(th)
 
 
-def _ray_scores(gray, cx, cy, r, delta, n_rays, V, r_ray=None):
+def _ray_scores(gray, cx, cy, r, delta, n_rays, V, r_ray=None, widths=None):
     """沿射线采样并对每档线宽打分。
 
     r_ray：每条射线的预测半径（椭圆时用），None 时都等于 r。采样半径 s 是相对 r_ray 的偏移。
+    widths：只试这些线宽（快路径用上一帧实测线宽），None 时按 r 生成全部候选。
     返回 dict: thetas, s (相对偏移), iw (找峰窗口下标), inside (射线全在图内),
               scores[j] (n_rays x len(iw))，widths, r_ray
     """
     H, W = gray.shape
-    widths = _widths(r, V.width_ratio)
+    widths = _widths(r, V.width_ratio) if widths is None else [float(w) for w in widths]
     step = V.step
     th, ct, st = _angles(n_rays)
     rr = np.full(n_rays, float(r)) if r_ray is None else np.asarray(r_ray, np.float64)
@@ -243,10 +244,10 @@ def _ellipse_residual(pts, ex, ey, a, b, ang_deg):
     return (np.hypot(qx / a, qy / b) - 1) * (a + b) / 2
 
 
-def _peaks(gray, cx, cy, r, delta, noise, V, r_ray=None):
+def _peaks(gray, cx, cy, r, delta, noise, V, r_ray=None, widths=None):
     """射线找峰。返回 (m 半成品, px 有效峰点, peak 对比, valid 掩码, n_rays) 或 (m, None...)。"""
     n_rays = V.rays_large if r >= V.rays_large_r else V.rays_small
-    d = _ray_scores(gray, cx, cy, r, delta, n_rays, V, r_ray)
+    d = _ray_scores(gray, cx, cy, r, delta, n_rays, V, r_ray, widths)
     inside = d['inside']
     m = Measurement(False, '', n_rays=n_rays, n_inside=int(inside.sum()))
     if m.n_inside < 8:
@@ -298,9 +299,9 @@ def _finish(m, pu, px, pk, inl, cen_u, n_rays, V, cam):
     m.cx, m.cy = float(c[0]), float(c[1])
 
 
-def _one_pass(gray, cam, cx, cy, r, delta, noise, V, rng):
+def _one_pass(gray, cam, cx, cy, r, delta, noise, V, rng, widths=None):
     """圆模型。"""
-    m, px, pk, _, n_rays = _peaks(gray, cx, cy, r, delta, noise, V)
+    m, px, pk, _, n_rays = _peaks(gray, cx, cy, r, delta, noise, V, widths=widths)
     if px is None:
         return m, None
     pu = cam.undistort(px)
@@ -400,47 +401,64 @@ def _ellipse_pass(gray, cam, m0, noise, V, rng):
     return best
 
 
-def measure(gray, cam, cx, cy, r, noise, V, mode='lock', delta=None, seed=0):
+def _gate_reason(m, cx, cy, r, V, mode):
+    lock = mode == 'lock'
+    min_sec = V.lock_sectors if lock else V.track_sectors
+    max_gap = V.lock_max_gap if lock else V.track_max_gap
+    min_inliers = V.lock_min_inlier_ratio if lock else V.min_inlier_ratio
+    shift_lim = V.lock_shift * r if lock else _delta(V.track_shift, r)
+    r_tol = V.lock_radius_tol if lock else V.track_radius_tol
+    if mode == 'local':
+        min_sec = max(V.track_sectors, V.lock_sectors - 2)
+        max_gap = min(V.track_max_gap, V.lock_max_gap + 2)
+        min_inliers = max(V.min_inlier_ratio, V.lock_min_inlier_ratio - .10)
+    if m.sectors < min_sec:
+        return f'sectors {m.sectors}<{min_sec}'
+    if m.max_gap > max_gap:
+        return f'gap {m.max_gap}>{max_gap}'
+    if m.inlier_ratio < min_inliers:
+        return f'inliers {m.inlier_ratio:.2f}'
+    if m.rms > _delta(V.lock_max_rms if lock else V.max_rms, m.r):
+        return f'rms {m.rms:.2f}'
+    if abs(m.r - r) > r_tol * r:
+        return f'radius {m.r:.1f} vs {r:.1f}'
+    shift = math.hypot(m.cx - cx, m.cy - cy)
+    if shift > shift_lim:
+        return f'shift {shift:.1f}'
+    return ''
+
+
+def measure(gray, cam, cx, cy, r, noise, V, mode='lock', delta=None, seed=0, circle_first=False,
+            quick=False, widths=None):
     """在 (cx, cy, r) 附近测量圆环。
 
     mode='lock'：首锁门槛，(cx, cy, r) 是搜索候选；
     mode='track'：跟踪门槛，(cx, cy, r) 是预测值。
+    mode='local'：可靠局部光流内的复核。
+    quick=True：只做一遍圆拟合、单档线宽、不试椭圆（稳定跟踪的快路径，失败时调用方再走完整复核）。
     """
     if V.backend not in ('auto', 'python'):
         raise ValueError('verify.backend 必须是 auto 或 python')
     if delta is None:
-        delta = _delta(V.delta_search if mode == 'lock' else V.delta_track, r)
+        delta = _delta(V.delta_search if mode in ('lock', 'local') else V.delta_track, r)
     rng = np.random.default_rng(seed)
-    m, _ = _one_pass(gray, cam, cx, cy, r, delta, noise, V, rng)
+    m, _ = _one_pass(gray, cam, cx, cy, r, delta, noise, V, rng, widths=widths)
     if m.reason:
         return m
-    # 第二遍：射线从新圆心出发与圆环垂直；窗口保持不变，内点率才有区分力
-    m2, _ = _one_pass(gray, cam, m.cx, m.cy, m.r, delta, noise, V, rng)
-    if not m2.reason:
-        m = m2
-    # 圆模型扇区不够或残差偏大时试椭圆模型（斜视）；椭圆扇区更多才采用
-    if V.use_ellipse and (m.sectors < V.sectors or m.rms > _delta(V.lock_max_rms, m.r)):
+    if not quick:
+        # 第二遍：射线从新圆心出发与圆环垂直；窗口保持不变，内点率才有区分力
+        m2, _ = _one_pass(gray, cam, m.cx, m.cy, m.r, delta, noise, V, rng)
+        if not m2.reason:
+            m = m2
+    reason = _gate_reason(m, cx, cy, r, V, mode)
+    # 局部光流可靠且圆拟合合格时，不必再拟合椭圆。
+    circle_ok = not reason and (mode == 'local' or (
+        circle_first and m.sectors >= V.lock_sectors and m.max_gap <= V.lock_max_gap
+        and m.inlier_ratio >= V.lock_min_inlier_ratio and m.rms <= _delta(V.lock_max_rms, m.r)))
+    if not quick and V.use_ellipse and not circle_ok and (m.sectors < V.sectors or m.rms > _delta(V.lock_max_rms, m.r)):
         me = _ellipse_pass(gray, cam, m, noise, V, rng)
         if me is not None and (me.sectors, -me.rms) > (m.sectors, -m.rms):
             m = me
-    # 门槛
-    lock = mode == 'lock'
-    min_sec = V.lock_sectors if lock else V.track_sectors
-    max_gap = V.lock_max_gap if lock else V.track_max_gap
-    shift_lim = V.lock_shift * r if lock else _delta(V.track_shift, r)
-    r_tol = V.lock_radius_tol if lock else V.track_radius_tol
-    if m.sectors < min_sec:
-        m.reason = f'sectors {m.sectors}<{min_sec}'
-    elif m.max_gap > max_gap:
-        m.reason = f'gap {m.max_gap}>{max_gap}'
-    elif m.inlier_ratio < (V.lock_min_inlier_ratio if lock else V.min_inlier_ratio):
-        m.reason = f'inliers {m.inlier_ratio:.2f}'
-    elif m.rms > _delta(V.lock_max_rms if lock else V.max_rms, m.r):
-        m.reason = f'rms {m.rms:.2f}'
-    elif abs(m.r - r) > r_tol * r:
-        m.reason = f'radius {m.r:.1f} vs {r:.1f}'
-    elif math.hypot(m.cx - cx, m.cy - cy) > shift_lim:
-        m.reason = f'shift {math.hypot(m.cx - cx, m.cy - cy):.1f}'
-    else:
-        m.ok = True
+            reason = _gate_reason(m, cx, cy, r, V, mode)
+    m.reason, m.ok = reason, not reason
     return m

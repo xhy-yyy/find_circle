@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import cv2
 
-GREEN, ORANGE, RED, CYAN, YELLOW, GRAY = (0, 220, 0), (0, 160, 255), (0, 0, 255), (255, 255, 0), (0, 255, 255), (150, 150, 150)
+GREEN, ORANGE, RED, CYAN, YELLOW, GRAY = (0, 255, 0), (0, 160, 255), (0, 0, 255), (255, 255, 0), (0, 255, 255), (150, 150, 150)
 SHIFT = 4   # 亚像素画图
 
 
@@ -52,12 +52,21 @@ def draw_result(frame, res, scale=1.0):
     if res.center_px is not None:
         x, y = res.center_px[0] * sp, res.center_px[1] * sp
         color = GREEN if res.state == 'DETECTED' else ORANGE
+        dark = (0, 0, 0)
+        # 先画黑色粗描边再压亮色，草地/红跑道背景上也能一眼看到
         if res.ellipse is not None:
             cx, cy, a, b, ang = res.ellipse
-            cv2.ellipse(img, ((cx * sp, cy * sp), (2 * a * sp, 2 * b * sp), ang), color, 1, cv2.LINE_AA)
+            axes = (2 * a * sp, 2 * b * sp)
+            cv2.ellipse(img, ((cx * sp, cy * sp), axes, ang), dark, 4, cv2.LINE_AA)
+            cv2.ellipse(img, ((cx * sp, cy * sp), axes, ang), color, 3, cv2.LINE_AA)
         else:
-            circle(img, x, y, res.radius_px * sp, color)
-        cross(img, x, y, max(4, res.radius_px * 0.3) * sp, color)
+            circle(img, x, y, res.radius_px * sp, dark, th=4)
+            circle(img, x, y, res.radius_px * sp, color, th=3)
+        size = max(6, res.radius_px * 0.45) * sp
+        cross(img, x, y, size, dark, th=4)
+        cross(img, x, y, size, color, th=3)
+        cv2.circle(img, (int(round(x)), int(round(y))), max(3, int(round(2 * sp))), dark, -1, cv2.LINE_AA)
+        cv2.circle(img, (int(round(x)), int(round(y))), max(2, int(round(1.2 * sp))), color, -1, cv2.LINE_AA)
     color = {'DETECTED': GREEN, 'PREDICTED': ORANGE}.get(res.state, RED)
     s = f'#{res.frame_id}  {res.state} / {res.phase}  ID={res.target_id}'
     if d.get('prediction_source') == 'appearance':
@@ -74,7 +83,9 @@ def draw_result(frame, res, scale=1.0):
     lines.append((position, (255, 255, 255)))
     fps = f"{d['fps']:.1f}" if d.get('fps', 0) > 0 else '--'
     timing = f"FPS: {fps}  Core: {d.get('ms', 0):.1f}ms"
-    if 'frame_age_ms' in d:
+    if d.get('camera_fps', 0) > 0:
+        timing += f"  Cam: {d['camera_fps']:.0f}fps"
+    elif 'frame_age_ms' in d:
         timing += f"  Frame age: {d['frame_age_ms']:.0f}ms"
     elif 'source_fps' in d:
         timing += f"  Video: {d['source_fps']:.1f}fps"

@@ -1,24 +1,39 @@
 # 固定 CPU 峰值筛选；CUDA 模块不可用时回退 CPU。
 search:
-  radii_per_job: 2
+  budget_ms: 48.0
+  radii_per_job: 6
   click_focus_half: 240
   click_focus_radii_per_job: 6
   verify_pending_first: true
   fft_cache_mb: 96.0
   async_ed: true
+  async_search: false
+  escalate_s: 1.5
+  click_max_levels: 2
 
 verify:
   backend: auto
 
 motion:
   backend: auto
+  width: 560
+  max_corners: 160
+  refresh_ratio: 0.4
 
 track:
-  identity_every: 3
+  identity_every: 4
+  identity_init_hits: 4
+  fast_measure_every: 5
+  online_update_frames: 6
+  reacq_weak_hits: 3
+  reacq_giveup_s: 6.0
+  lost_r_floor: 0.3
   small_ring_geometry_hits: 8
+  local_reacq_hits: 2
   stable_template_grace_s: 0.075
   template_backend: auto
   template_cuda_min_area: 90000
   recovery_local_s: 0.12
+  stagger_recovery_scales: true
   compact_gpu_matching: false
   online_learning: true

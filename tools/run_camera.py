@@ -27,6 +27,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 import cv2
 
@@ -128,28 +129,45 @@ class AsyncVideoWriter(threading.Thread):
 
 
 class LatestFrame(threading.Thread):
-    """采集线程只留最新一帧，处理慢时丢旧帧而不是排队。"""
+    """只解码主循环能接收的帧，录像独立接收相机原始帧。"""
 
-    def __init__(self, cap, recorder=None):
+    def __init__(self, cap, recorder=None, always_retrieve=False):
         super().__init__(daemon=True)
         self.cap = cap
         self.lock = threading.Lock()
         self.frame = None
         self.stamp = 0.0
         self.seq = 0
+        self.taken_seq = 0
         self.alive = True
         self.recorder = recorder
+        self.always_retrieve = always_retrieve   # 硬件解码通路：免去软件 JPEG 解码，每帧都取最新
         self._record_warned = False
 
     def run(self):
+        captured = 0
         while self.alive:
-            ok, f = self.cap.read()
+            ok = self.cap.grab()
             t = time.monotonic()
             if not ok:
                 time.sleep(0.005)
                 continue
+            captured += 1
+            with self.lock:
+                wanted = self.taken_seq == self.seq
+            if not wanted and self.recorder is None and not self.always_retrieve:
+                continue
+            ok, f = self.cap.retrieve()
+            if not ok or f is None:
+                continue
+            if f.ndim == 3 and f.shape[2] == 4:
+                f = cv2.cvtColor(f, cv2.COLOR_BGRA2BGR)
             if f.ndim == 2 and f.shape[0] == 1:
                 packet = f
+                if self.recorder is not None:
+                    self.recorder.submit(packet.tobytes())
+                if not wanted:
+                    continue
                 try:
                     f = cv2.imdecode(packet, cv2.IMREAD_COLOR)
                 except cv2.error:
@@ -158,19 +176,47 @@ class LatestFrame(threading.Thread):
                     self.cap.set(cv2.CAP_PROP_CONVERT_RGB, 1)
                     print('[相机] 原始 MJPEG 解码失败，回退到采集后端解码', file=sys.stderr)
                     continue
-                if self.recorder is not None:
-                    self.recorder.submit(packet.tobytes())
             elif self.recorder is not None:
                 if self.recorder.copy_mjpeg and not self._record_warned:
                     print('[录像] 采集后端返回 BGR，使用后台 JPEG 编码', file=sys.stderr)
                     self._record_warned = True
                 self.recorder.submit(f)
-            with self.lock:
-                self.frame, self.stamp, self.seq = f, t, self.seq + 1
+            if wanted or self.always_retrieve:
+                with self.lock:
+                    self.frame, self.stamp, self.seq = f, t, captured
 
     def get(self):
         with self.lock:
+            self.taken_seq = self.seq
             return self.frame, self.stamp, self.seq
+
+
+def open_camera(dev, W, H, fps, capture='auto', pixel_format='MJPG'):
+    """打开相机。auto 且是 Jetson + MJPG 时走 NVDEC 硬解，JPEG 解码不占 CPU；
+    返回 (cap, 是否 GStreamer 通路)。"""
+    plugin = Path('/usr/lib/aarch64-linux-gnu/gstreamer-1.0/libgstnvvideo4linux2.so')
+    if capture == 'auto' and pixel_format == 'MJPG' and plugin.is_file():
+        device = str(dev).replace('\\', '\\\\').replace('"', '\\"')
+        pipeline = (f'v4l2src device="{device}" io-mode=2 ! '
+                    f'image/jpeg,width={W},height={H},framerate={fps}/1 ! '
+                    'jpegparse ! nvv4l2decoder mjpeg=true ! nvvidconv ! '
+                    'video/x-raw,format=BGRx ! '
+                    'appsink max-buffers=1 drop=true sync=false')
+        cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+        if cap.isOpened():
+            print(f'相机采集：{W}x{H} MJPG {fps} fps，NVIDIA NVDEC 硬解，只保留最新帧', file=sys.stderr)
+            return cap, True
+        cap.release()
+        print('硬件采集通路不可用，回退 V4L2', file=sys.stderr)
+    cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*pixel_format))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, W)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, H)
+    cap.set(cv2.CAP_PROP_FPS, fps)
+    # 只留 1 个缓冲时，取帧/还帧之间驱动放不下下一帧，会隔一帧丢一帧（实测只剩 15 fps）。
+    # 2 个缓冲即可恢复 29.9 fps，代价只是最多多 1 帧延迟。
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+    return cap, False
 
 
 def main():
@@ -185,12 +231,15 @@ def main():
     ap.add_argument('--record')
     ap.add_argument('--record-mode', choices=['auto', 'encode'], default='auto',
                     help='auto 优先直存相机 MJPEG，encode 使用后台软件编码')
+    ap.add_argument('--capture', choices=['auto', 'v4l2'], default='auto',
+                    help='auto 优先 NVIDIA MJPEG 硬解；v4l2 为兼容路径')
+    ap.add_argument('--camera-format', choices=['MJPG', 'YUYV'], default='MJPG', help='USB 摄像头传输格式')
     ap.add_argument('--threads', type=int, default=4, help='OpenCV CPU 线程数')
     ap.add_argument('--display-fps', type=float, default=15, help='预览刷新率，识别仍逐帧运行')
     ap.add_argument('--log', help='每帧结果同时写入这个 JSONL 文件')
     ap.add_argument('--show', action='store_true')
     ap.add_argument('--quiet', action='store_true')
-    ap.add_argument('--stats', action='store_true', help='每秒打印实际处理帧率、漏处理帧数及算法 P95')
+    ap.add_argument('--stats', action='store_true', help='每秒打印采集帧率、实际处理帧率、漏处理帧数及算法 P95')
     ap.add_argument('--stale-ms', type=float, default=200, help='超过这么久没有新帧就发 LOST 心跳')
     ap.add_argument('--params')
     ap.add_argument('--set', action='append', default=[])
@@ -200,20 +249,17 @@ def main():
     cv2.setNumThreads(a.threads)
 
     W, H = (int(v) for v in a.size.split('x'))
-    cap = cv2.VideoCapture(a.dev, cv2.CAP_V4L2)
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, W)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, H)
-    cap.set(cv2.CAP_PROP_FPS, a.fps)
-    # 只留 1 个缓冲时，取帧/还帧之间驱动放不下下一帧，会隔一帧丢一帧（实测只剩 15 fps）。
-    # 2 个缓冲即可恢复 29.9 fps，代价只是最多多 1 帧延迟。
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+    cap, hardware = open_camera(a.dev, W, H, a.fps, a.capture, a.camera_format)
     if not cap.isOpened():
         sys.exit(f'打不开相机 {a.dev}')
-    rw, rh = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fourcc = int(cap.get(cv2.CAP_PROP_FOURCC)).to_bytes(4, 'little').decode(errors='replace')
-    source_fps = cap.get(cv2.CAP_PROP_FPS) or a.fps
-    print(f'相机：{rw}x{rh} {fourcc} {cap.get(cv2.CAP_PROP_FPS):.0f} fps', file=sys.stderr)
+    if hardware:
+        rw, rh, fourcc, negotiated_fps = W, H, 'MJPG', float(a.fps)
+    else:
+        rw, rh = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fourcc = int(cap.get(cv2.CAP_PROP_FOURCC)).to_bytes(4, 'little').decode(errors='replace')
+        negotiated_fps = cap.get(cv2.CAP_PROP_FPS)
+    source_fps = negotiated_fps if negotiated_fps > 0 else a.fps
+    print(f'相机：{rw}x{rh} {fourcc} {negotiated_fps:g} fps（请求 {a.fps:g}）', file=sys.stderr)
     if (rw, rh) != (W, H):
         print(f'[警告] 实际分辨率 {rw}x{rh} 与要求 {W}x{H} 不同', file=sys.stderr)
     P = Params.load(a.params, a.set)
@@ -272,7 +318,8 @@ def main():
 
     writer = None
     if a.record:
-        copy_mjpeg = (a.record_mode == 'auto' and fourcc == 'MJPG' and shutil.which('ffmpeg') is not None
+        copy_mjpeg = (not hardware and a.record_mode == 'auto' and fourcc == 'MJPG'
+                      and shutil.which('ffmpeg') is not None
                       and cap.set(cv2.CAP_PROP_CONVERT_RGB, 0))
         writer = AsyncVideoWriter(a.record, source_fps, (rw, rh), copy_mjpeg)
         print('录像：' + ('直存 MJPEG' if writer.copy_mjpeg else '后台 MJPEG 编码'), file=sys.stderr)
@@ -283,7 +330,7 @@ def main():
         cv2.setMouseCallback('ringdet', lambda ev, x, y, *_: clicks.append((x / disp_scale, y / disp_scale))
                              if ev == cv2.EVENT_LBUTTONDOWN else None)
 
-    grab = LatestFrame(cap, writer)
+    grab = LatestFrame(cap, writer, always_retrieve=hardware)
     grab.start()
     last_seq = 0
     last_new = time.monotonic()
@@ -291,6 +338,7 @@ def main():
     last_backend = trk.motion.backend
     stats_start, stats_count, stats_skipped, stats_ms = time.monotonic(), 0, 0, []
     measured_fps = 0.0
+    capture_fps = 0.0
     last_search_error = last_match_error = ''
     try:
         while True:
@@ -333,25 +381,28 @@ def main():
                 print(f'[CUDA 匹配回退] {last_match_error}', file=sys.stderr)
             d = res.to_dict()
             d['frame_age_ms'] = (time.monotonic() - stamp) * 1000
+            d['ms'] = res.debug.get('ms')
+            d['camera_fps'] = capture_fps
             emit(d)
             stats_count += 1
             stats_ms.append(res.debug['ms'])
             elapsed = time.monotonic() - stats_start
             if elapsed >= 1:
                 measured_fps = stats_count / elapsed
+                capture_fps = (stats_count + stats_skipped) / elapsed
                 if a.stats:
                     ordered = sorted(stats_ms)
                     p95 = ordered[max(0, math.ceil(.95 * len(ordered)) - 1)]
-                    print(f'[性能] 实际处理 {measured_fps:.1f} FPS，漏处理 {stats_skipped} 帧，'
+                    print(f'[性能] 采集 {capture_fps:.1f} FPS，实际处理 {measured_fps:.1f} FPS，漏处理 {stats_skipped} 帧，'
                           f'算法 P95 {p95:.1f} ms，帧龄 {d["frame_age_ms"]:.1f} ms', file=sys.stderr)
                 stats_start, stats_count, stats_skipped, stats_ms = time.monotonic(), 0, 0, []
             res.debug['fps'] = measured_fps
+            res.debug['camera_fps'] = capture_fps
             res.debug['frame_age_ms'] = d['frame_age_ms']
             if a.show:
                 display_time = time.monotonic()
                 if display_time - last_display >= 1 / a.display_fps:
-                    vis = draw_result(frame, res)
-                    cv2.imshow('ringdet', cv2.resize(vis, None, fx=disp_scale, fy=disp_scale) if disp_scale < 1 else vis)
+                    cv2.imshow('ringdet', draw_result(frame, res, scale=disp_scale))
                     last_display = display_time
                 k = cv2.waitKey(1) & 0xFF
                 if k == ord('q'):
