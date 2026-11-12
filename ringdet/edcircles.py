@@ -44,19 +44,30 @@ def _load():
                 lib.edc_flow_fb.restype = ctypes.c_int
                 lib.edc_flow_fb.argtypes = [ctypes.c_void_p, ctypes.c_void_p] + [ctypes.c_int] * 4 + [
                     ctypes.c_void_p, ctypes.c_int] + [ctypes.c_void_p] * 4
-            if hasattr(lib, 'edc_ellipse_hypotheses'):
-                lib.edc_ellipse_hypotheses.restype = ctypes.c_int
-                lib.edc_ellipse_hypotheses.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
+            if hasattr(lib, 'edc_ellipse_fit'):
+                lib.edc_ellipse_fit.restype = ctypes.c_int
+                lib.edc_ellipse_fit.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
                     ctypes.c_int, ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_void_p, ctypes.c_void_p]
             if hasattr(lib, 'edc_huber_circle'):
                 lib.edc_huber_circle.restype = ctypes.c_int
                 lib.edc_huber_circle.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
                                                ctypes.c_double, ctypes.c_int]
-            if hasattr(lib, 'edc_ray_scores'):
+            if hasattr(lib, 'edc_ransac_circle'):
+                lib.edc_ransac_circle.restype = ctypes.c_int
+                lib.edc_ransac_circle.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
+                    ctypes.c_int, ctypes.c_double, ctypes.c_double, ctypes.c_double,
+                    ctypes.c_void_p, ctypes.c_void_p]
+            if hasattr(lib, 'edc_ray_scores') and hasattr(lib, 'edc_peak_pick'):
                 lib.edc_ray_scores.restype = ctypes.c_int
                 lib.edc_ray_scores.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
                     ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_int,
-                    ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_void_p]
+                    ctypes.c_double, ctypes.c_double, ctypes.c_double,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+            if hasattr(lib, 'edc_peak_pick'):
+                lib.edc_peak_pick.restype = ctypes.c_int
+                lib.edc_peak_pick.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_double, ctypes.c_double,
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
             _lib = lib
             _lib_err = None
             return _lib
@@ -97,18 +108,20 @@ def flow_fb(prev, current, points):
     return None if rc else (nxt, forward, back, backward)
 
 
-def ellipse_hypotheses(points, samples, radius, tolerance, axis_ratio):
+def ellipse_fit(points, samples, radius, tolerance, axis_ratio):
+    """5 点椭圆假设并行评估 + 内点精修。返回 (内点数, (cx, cy, a, b, angle_deg), mask)；
+    内点数 < 12 或精修失败（-2）时 mask 无意义，调用方沿用上一轮结果。"""
     lib = _load()
-    if lib is None or not hasattr(lib, 'edc_ellipse_hypotheses'):
+    if lib is None or not hasattr(lib, 'edc_ellipse_fit'):
         return None
     points = np.ascontiguousarray(points, np.float64)
     samples = np.ascontiguousarray(samples, np.int32)
     ellipse, mask = np.empty(5, np.float64), np.zeros(len(points), np.uint8)
-    rc = lib.edc_ellipse_hypotheses(points.ctypes.data, len(points), samples.ctypes.data, len(samples),
-                                   radius, tolerance, axis_ratio, ellipse.ctypes.data, mask.ctypes.data)
-    if rc < 0:
+    rc = lib.edc_ellipse_fit(points.ctypes.data, len(points), samples.ctypes.data, len(samples),
+                             radius, tolerance, axis_ratio, ellipse.ctypes.data, mask.ctypes.data)
+    if rc < 0 and rc != -2:
         return None
-    return ellipse, mask.astype(bool)
+    return rc, tuple(float(v) for v in ellipse), mask.astype(bool)
 
 
 def huber_circle(points, center, radius, delta, iterations):
@@ -121,17 +134,58 @@ def huber_circle(points, center, radius, delta, iterations):
     return None if rc else (circle[:2], float(circle[2]))
 
 
-def ray_scores(profiles, positions, widths, step, gap, side_ratio):
+def ray_scores(profiles, positions, widths, step, gap, side_ratio, inside=None):
+    """返回 (每档线宽的分数列表, 每档线宽"每条射线最高分"的中位数)。"""
     lib = _load()
-    if lib is None or not hasattr(lib, 'edc_ray_scores'):
+    if lib is None or not hasattr(lib, 'edc_ray_scores') or not hasattr(lib, 'edc_peak_pick'):
         return None
     profiles = np.ascontiguousarray(profiles, np.float64)
     positions = np.ascontiguousarray(positions, np.int32)
     widths = np.ascontiguousarray(widths, np.float64)
+    mask = None if inside is None else np.ascontiguousarray(inside, np.uint8)
     scores = np.empty((len(widths), profiles.shape[0], len(positions)), np.float64)
+    medians = np.empty(len(widths), np.float64)
     rc = lib.edc_ray_scores(profiles.ctypes.data, *profiles.shape, positions.ctypes.data,
-        len(positions), widths.ctypes.data, len(widths), step, gap, side_ratio, scores.ctypes.data)
-    return None if rc else list(scores)
+        len(positions), widths.ctypes.data, len(widths), step, gap, side_ratio,
+        None if mask is None else mask.ctypes.data, scores.ctypes.data, medians.ctypes.data)
+    return None if rc else (list(scores), medians)
+
+
+def ransac_circle(points, samples, tolerance, r_min, r_max):
+    """圆模型 RANSAC + Huber 精修。返回 (圆心, 半径, 内点掩码)；没有合格拟合返回 None；
+    原生库不可用时返回 False（调用方退回 numpy 实现）。"""
+    lib = _load()
+    if lib is None or not hasattr(lib, 'edc_ransac_circle'):
+        return False
+    points = np.ascontiguousarray(points, np.float64)
+    samples = np.ascontiguousarray(samples, np.int32)
+    circle = np.empty(3, np.float64)
+    mask = np.zeros(len(points), np.uint8)
+    rc = lib.edc_ransac_circle(points.ctypes.data, len(points), samples.ctypes.data, len(samples),
+                               tolerance, r_min, r_max, circle.ctypes.data, mask.ctypes.data)
+    if rc <= 0:
+        return None
+    return circle[:2].copy(), float(circle[2]), mask.astype(bool)
+
+
+def peak_pick(scores, r_ray, s_iw, step, threshold, inside):
+    """每条射线取峰：返回 (列下标, 峰值, 半径距离, 有效掩码)。"""
+    lib = _load()
+    if lib is None or not hasattr(lib, 'edc_peak_pick'):
+        return None
+    scores = np.ascontiguousarray(scores, np.float64)
+    r_ray = np.ascontiguousarray(r_ray, np.float64)
+    s_iw = np.ascontiguousarray(s_iw, np.float64)
+    mask = np.ascontiguousarray(inside, np.uint8)
+    rays, count = scores.shape
+    index = np.empty(rays, np.int32)
+    peak = np.empty(rays, np.float64)
+    distance = np.empty(rays, np.float64)
+    valid = np.empty(rays, np.uint8)
+    rc = lib.edc_peak_pick(scores.ctypes.data, rays, count, r_ray.ctypes.data, s_iw.ctypes.data,
+                           step, threshold, mask.ctypes.data, index.ctypes.data, peak.ctypes.data,
+                           distance.ctypes.data, valid.ctypes.data)
+    return None if rc else (index, peak, distance, valid.astype(bool))
 
 
 def _detect_edlib(gray, grad, anchor, sigma, min_path, op, scan, validate):

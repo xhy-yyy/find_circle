@@ -27,6 +27,7 @@ class SearchParams:
     tile: int = 512              # 分块边长（层内 px），块间重叠 = 最大核半径
     radii_per_job: int = 6       # 每个任务 = 一块 x 至多这么多个半径
     budget_ms: float = 40.0      # 搜索候选生成与复核共用的每帧预算
+    verify_pending_first: bool = False  # 优先复核积压候选，预算耗尽时也允许一次复核
     min_score: float = 2.0       # S = min(M-I, M-O) / max(sigma, noise_floor)
     side_ratio: float = 3.0      # |I-O| > side_ratio*S 的位置不当候选
     noise_floor: float = 2.0
@@ -61,9 +62,11 @@ class SearchParams:
     escalate_s: float = 3.0      # 框内这么久没有候选通过复核就扩大一级
     click_max_levels: int = 1    # 最多扩大几级（每级边长 x2）；0 = 只在初始框里找
     click_only: bool = True      # True：没点击就不搜索（输出 LOST）；False：没点击时全图搜索
-    fft_cache_mb: float = 64.0    # 核频谱缓存上限
+    fft_cache_mb: float = 96.0    # 核频谱缓存上限
     async_ed: bool = True        # 区域 ED 在单个后台线程执行，结果在当前帧重新验证
     click_focus_r_max: float = 12.0  # 点击附近高频复查的小环半径上限
+    click_focus_half: int = 0  # 0 = 使用 click_tile 作为局部搜索半边长
+    click_focus_radii_per_job: int = 0  # 0 = 使用 radii_per_job
 
 
 @dataclass
@@ -126,6 +129,7 @@ class TrackParams:
     confirm_window: int = 5      # 最近 confirm_window 个处理帧中
     confirm_hits: int = 3        # 至少 confirm_hits 帧通过，且当前帧通过
     identity_init_hits: int = 6
+    small_ring_geometry_hits: int = 0  # 小圆未获 ED 支持时所需的连续强复核帧数
     assoc: Tuple[float, float] = (3.0, 0.25)   # 同一候选：中心差 <= max(a, b*r)
     assoc_radius: float = 0.15   # 且半径差 <= 15%
     max_cands: int = 30
@@ -134,6 +138,7 @@ class TrackParams:
     coast_s: float = 0.3
     stable_track_frames: int = 6
     stable_no_flow_s: float = 0.12
+    stable_template_grace_s: float = 0.0  # 光流可靠时短暂等待几何复核恢复
     appearance_coast_s: float = 0.5
     appearance_score: float = 0.85
     appearance_psr: float = 2.0
@@ -150,6 +155,7 @@ class TrackParams:
     lost_r_floor: float = 0.5
     template_score: float = 0.65  # 局部外观匹配通过后仍需几何复核
     identity_score: float = 0.8   # 重捕身份分；较弱结果还须严格几何与更长确认
+    identity_every: int = 1       # 稳定跟踪时每 N 帧做一次身份比对；1 = 每帧
     identity_margin: float = 0.06  # 两个重捕候选的身份分太接近时暂不接回
     reacq_confirm_hits: int = 3
     reacq_weak_hits: int = 5
@@ -157,6 +163,8 @@ class TrackParams:
     learn_rate: float = 0.15     # 可靠测量的工作模板、形状和运动统计更新率
     frame_budget_ms: float = 28.0  # 包含预处理和光流的整帧软预算
     template_backend: str = 'auto'  # auto / cpu / cuda；CUDA 用于较大的重捕图块
+    template_cuda_min_area: int = 0  # auto 模式使用 CUDA 的最小搜索面积（px²）
+    recovery_local_s: float = 0.0    # 光流可靠时先在预测点附近重捕的时长
     compact_gpu_matching: bool = True
     online_learning: bool = True   # 背景感知相关滤波，只产生重捕候选
     online_min_radius: float = 8.0  # 小于此像素半径保留原像素模板路径

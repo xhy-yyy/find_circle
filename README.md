@@ -48,7 +48,14 @@ python3 -m pytest -q tests/
 
 `python3 -m ringdet.edcircles` 打印当前用的 EDCircles 后端。没编译 `.so` 时会退回 opencv-contrib 的 `cv2.ximgproc`（同源移植，结果略有不同）；两者都没有时只用匹配滤波，首锁不再要求 EDCircles。
 
-Jetson 上同样运行 `./build.sh`，JetPack 自带的 OpenCV 就够，不需要 contrib 和 CUDA。
+Jetson Orin 已安装 JetPack CUDA 开发工具后，可一键配置项目专用 CUDA OpenCV 环境：
+
+```bash
+./setup_jetson.sh
+./setup_jetson.sh --check
+```
+
+脚本会安装依赖、编译或复用 CUDA OpenCV、建立 `.venv-cuda`、编译项目并验证 GPU；`run.sh` 自动使用该环境，系统 OpenCV 保留。默认保持功耗模式；`--power max` 只切换已经开放的官方 MAXN_SUPER 档，不更新启动固件、不自动重启。仅 CPU 运行仍可使用系统 OpenCV 和 `./build.sh`。
 
 ## 测试图片和视频
 
@@ -79,6 +86,20 @@ CALIB=cam.yaml UDP_OUT=地面站IP:9000 LISTEN=9001 ./run.sh camera
 默认保持摄像头原有曝光和对焦设置。曾设置手动曝光、需要恢复自动时，运行 `EXPOSURE=auto ./run.sh camera`。户外需要限制运动拖影时，可用 `EXPOSURE=20 ./run.sh camera` 显式设置 2 ms 手动曝光，并根据画面亮度调试。数字曝光值的单位是 100 µs；控件名称以 `v4l2-ctl -l` 为准。
 
 Jetson Orin Nano 更新代码后先运行 `./build.sh`，在板端编译 CPU 金字塔复用、射线评分、圆心精修和椭圆假设验证函数。Python OpenCV 与 C++ OpenCV 应使用同一套安装，不能复制电脑上的 `.so` 到板端。CUDA 需要 OpenCV 实际编译相应模块，仅安装 CUDA 驱动不会自动启用这些接口。
+
+`./run.sh` 在 Orin Nano 上默认加载 `orin_nano_8gb.yaml`，可用 `PARAMS` 指定其他配置。CPU 负责 FFT 搜索、几何复核、身份确认、在线学习和峰值筛选。CUDA 光流和大区域模板匹配分别检测可用性，各自保留 CPU 回退。Nano 点击附近的小环搜索每个 FFT 任务处理六个半径，完整搜索每次处理两个半径。积压候选优先复核，预算耗尽时仍允许一次原图复核。Nano 视频预览默认保存逐帧日志，指定 `--out out/标注.mp4` 时同时编码标注视频。相机预览默认 15 FPS。
+
+Nano 在地面光流可靠时，丢失后的前 0.12 秒优先在预测圆心附近匹配。超过时间或光流失效后使用原重捕范围。模板搜索面积低于 90000 像素时，`auto` 使用 CPU 共享 FFT。
+点击附近的小圆缺少 EDCircles 支持时，Nano 要求连续 8 帧全扇区有效、拟合残差不超过 0.35 像素，并通过跨帧外观一致性检查。
+
+```bash
+./build.sh
+SHOW=1 PARAMS=orin_nano_8gb.yaml ./run.sh camera --threads 4 --stats --quiet
+# 使用同一分配测试视频
+SHOW=1 PARAMS=orin_nano_8gb.yaml ./run.sh video ~/测试视频.mp4
+```
+
+启动日志中的“运动估计”“重捕匹配”显示实际后端；“峰值筛选：cpu”为本配置的固定分工。若前两项显示 CPU，表示对应 CUDA 设备或模块不可用，配置不会强行启用不存在的 GPU 接口。SEARCH FFT 当前为 CPU 实现，此配置不启用 CUDA FFT。录像与曝光沿用原设置；首次只测处理性能时，可在命令前加 `REC_DIR=""`。
 
 ```bash
 SHOW=1 ./run.sh camera --threads 4 --set motion.backend=auto --stats --quiet
@@ -154,7 +175,7 @@ verify:
 | `search.click_focus_r_max` | 12 | 点击附近高频复查的小环半径上限（px），完整范围仍交替轮询 |
 | `search.click_max_levels` | 1 | 点击框最多扩大几级；0 = 只在初始框里找 |
 | `search.async_ed` | true | 后台生成区域 ED 候选；false 使用同步搜索 |
-| `search.fft_cache_mb` | 64 | 核频谱缓存上限（MiB），避免高度变化导致无限增长 |
+| `search.fft_cache_mb` | 96 | 核频谱缓存上限（MiB），避免高度变化导致无限增长 |
 | `motion.backend` | auto | auto / cpu / cuda，auto 在 CUDA 不可用时回退 CPU |
 | `motion.refresh_frames` | 8 | 定期刷新角点；数量或局部覆盖不足时提前刷新 |
 | `track.frame_budget_ms` | 28 | 含光流和预处理的整帧软预算（ms） |

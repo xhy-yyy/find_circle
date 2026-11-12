@@ -125,7 +125,7 @@ class RingSearcher:
         a3 = ring_bands(max(radii_level), ratio, S.m_band_min, S.side_band_min)[3]
         return int(math.ceil(a3)) + 2
 
-    def plan(self, region, img_size, r_lo, r_hi, tile=None):
+    def plan(self, region, img_size, r_lo, r_hi, tile=None, radii_per_job=None):
         """region: 原图 (x0, y0, x1, y1)。返回覆盖该区域、该半径范围的全部分块。"""
         W, H = img_size
         jobs = []
@@ -142,7 +142,7 @@ class RingSearcher:
             tw = min(tile or self.P.search.tile, cv2.getOptimalDFTSize(rx1 - rx0 + 2 * m))
             th = min(tile or self.P.search.tile, cv2.getOptimalDFTSize(ry1 - ry0 + 2 * m))
             vw, vh = tw - 2 * m, th - 2 * m
-            n = self.P.search.radii_per_job
+            n = radii_per_job or self.P.search.radii_per_job
             chunks = [tuple(rl[i:i + n]) for i in range(0, len(rl), n)]
             for ty in range(ry0, ry1, vh):
                 for tx in range(rx0, rx1, vw):

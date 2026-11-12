@@ -2,7 +2,7 @@
 """视频回放跑完整跟踪器（多帧确认、跟踪、预测、重捕）。
 
 用法：
-  python3 tools/run_video.py video.mp4 [--out out/xxx_det.mp4] [--jsonl out/xxx.jsonl]
+  python3 tools/run_video.py video.mp4 [--out out/xxx_det.mp4 | --no-record] [--jsonl out/xxx.jsonl]
       [--click x,y[,帧号]]  第几帧点一下（默认第 0 帧）
       [--height 100 --fx 960 | --calib cam.yaml]
       [--start 秒] [--max-frames N] [--show]
@@ -26,7 +26,9 @@ from ringdet.draw import draw_result  # noqa: E402
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('video')
-    ap.add_argument('--out')
+    output = ap.add_mutually_exclusive_group()
+    output.add_argument('--out', help='保存标注视频')
+    output.add_argument('--no-record', action='store_true', help='跳过标注视频编码，可保留逐帧日志')
     ap.add_argument('--jsonl')
     ap.add_argument('--click')
     ap.add_argument('--height', type=float)
@@ -62,9 +64,15 @@ def main():
         click = (v[0], v[1], int(v[2]) if len(v) > 2 else 0)
 
     name = os.path.splitext(os.path.basename(a.video))[0]
-    out = a.out or os.path.join('out', f'{name}_det.mp4')
-    os.makedirs(os.path.dirname(out) or '.', exist_ok=True)
-    writer = cv2.VideoWriter(out, cv2.VideoWriter_fourcc(*'mp4v'), fps, (W, H))
+    out = None if a.no_record else a.out or os.path.join('out', f'{name}_det.mp4')
+    writer = None
+    if out:
+        os.makedirs(os.path.dirname(out) or '.', exist_ok=True)
+        writer = cv2.VideoWriter(out, cv2.VideoWriter_fourcc(*'mp4v'), fps, (W, H))
+        if not writer.isOpened():
+            sys.exit(f'无法创建标注视频：{out}')
+    if a.jsonl:
+        os.makedirs(os.path.dirname(a.jsonl) or '.', exist_ok=True)
     jf = open(a.jsonl, 'w', encoding='utf-8') if a.jsonl else None
 
     disp_scale = min(1.0, 1280 / W)
@@ -105,15 +113,17 @@ def main():
             if res.state == 'DETECTED' and first is None:
                 first = (i, stamp)
                 print(f'首锁：第 {i} 帧（{stamp:.2f} s） c=({res.center_px[0]:.1f},{res.center_px[1]:.1f}) r={res.radius_px:.1f}')
-            vis = draw_result(frame, res)
-            writer.write(vis)
+            if writer is not None:
+                writer.write(draw_result(frame, res))
+            if a.show:
+                vis = draw_result(frame, res, scale=disp_scale)
             if jf:
                 jf.write(json.dumps(res.to_dict(), ensure_ascii=False) + '\n')
             i += 1
             if a.max_frames and i >= a.max_frames:
                 break
         if a.show:
-            cv2.imshow('ringdet', cv2.resize(vis, None, fx=disp_scale, fy=disp_scale) if disp_scale < 1 else vis)
+            cv2.imshow('ringdet', vis)
             if paused:
                 delay = 0
             else:
@@ -129,7 +139,9 @@ def main():
                 stats_start, stats_count, measured_fps = next_display, 0, 0.0
             if k == ord('r'):
                 trk.reset()
-    writer.release()
+    if writer is not None:
+        writer.release()
+    cap.release()
     trk.close()
     if jf:
         jf.close()
@@ -137,7 +149,10 @@ def main():
     print(f'{n} 帧：' + '  '.join(f'{k} {v}' for k, v in counts.most_common()))
     if ms:
         print(f'每帧耗时 P50 {np.median(ms):.0f} ms，P95 {np.percentile(ms, 95):.0f} ms')
-    print(f'标注视频：{out}' + (f'，逐帧结果：{a.jsonl}' if a.jsonl else ''))
+    if out:
+        print(f'标注视频：{out}')
+    if a.jsonl:
+        print(f'逐帧结果：{a.jsonl}')
 
 
 if __name__ == '__main__':

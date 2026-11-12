@@ -13,10 +13,17 @@ UDP_OUT="${UDP_OUT:-}"                 # 结果发到哪里，如 192.168.1.10:9
 LISTEN="${LISTEN:-9001}"               # 接收点击/高度/重置的端口
 REC_DIR="${REC_DIR-$HOME/find_circle_rec}"   # 机载运行时录像和结果日志的目录；空 = 不录
 TARGET="${TARGET:-127.0.0.1}"          # click/height/reset 命令发往的视觉机地址
-PARAMS="${PARAMS:-}"                   # 调参 yaml；空 = 默认参数
 TEST_IMAGES="${TEST_IMAGES:-$HOME/桌面/无人机下视圆环图片}"
 # ------------------------------------------------------------------------------------------------------------
 
+if [[ ! -v PARAMS && -f orin_nano_8gb.yaml && -r /proc/device-tree/model ]] &&
+   [[ $(tr -d '\000' </proc/device-tree/model) == *"Jetson Orin Nano"* ]]; then
+  PARAMS=orin_nano_8gb.yaml
+fi
+PARAMS="${PARAMS:-}"                   # 显式置空使用通用参数
+if [[ -z "${PY:-}" && -x .venv-cuda/bin/python3 ]]; then
+  PY="$PWD/.venv-cuda/bin/python3"
+fi
 PY="${PY:-python3}"
 STAMP="$(date +%Y%m%d_%H%M%S)"
 PARAM_ARGS=()
@@ -43,6 +50,7 @@ cmd_help() {
   setup                       检查依赖、编译 ED_Lib、跑测试（第一次先运行这个）
   image [图片或文件夹 ...]     测图片；不给路径时测 $TEST_IMAGES。其余参数传给 tools/run_image.py
   video <视频> [x,y]           测视频，x,y 是第 0 帧的点击位置（原图像素）；SHOW=1 时弹窗显示，可用鼠标点
+                              --no-record 跳过标注编码；Nano 预览默认启用，--out 指定文件可保存
   camera                       机载运行：设置相机、识别、发结果、录像（配置见脚本开头）
   click <u> <v>                发点击，u、v 为 0~1 的归一化坐标（相对原始图像宽高）
   height <米|null>              发离地高度
@@ -102,7 +110,16 @@ cmd_video() {
   fi
   local name; name="$(basename "${video%.*}")"
   local out="out/video_${name}_$STAMP"
-  has_arg --out "$@" || args+=(--out "$out.mp4" --jsonl "$out.jsonl")
+  if ! has_arg --out "$@"; then
+    if ! has_arg --no-record "$@"; then
+      if [[ "${PARAMS##*/}" == orin_nano_8gb.yaml ]] && { [[ "${SHOW:-0}" == 1 ]] || has_arg --show "$@"; }; then
+        args+=(--no-record)
+      else
+        args+=(--out "$out.mp4")
+      fi
+    fi
+    has_arg --jsonl "$@" || args+=(--jsonl "$out.jsonl")
+  fi
   [[ "${SHOW:-0}" == 1 ]] && args+=(--show)
   "$PY" tools/run_video.py "$video" "${PARAM_ARGS[@]}" "${args[@]}" "$@"
 }

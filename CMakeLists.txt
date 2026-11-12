@@ -9,6 +9,7 @@ endif()
 
 # CUDA 由 Python OpenCV 按需调用，CPU 光流复用 video 模块的金字塔。
 find_package(OpenCV REQUIRED COMPONENTS core imgproc video)
+find_package(OpenMP REQUIRED)
 
 set(EDLIB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ED_Lib)
 add_library(edcircles SHARED
@@ -20,7 +21,9 @@ add_library(edcircles SHARED
   ${EDLIB_DIR}/EDColor.cpp
   ${EDLIB_DIR}/NFA.cpp)
 target_include_directories(edcircles PRIVATE ${EDLIB_DIR} ${OpenCV_INCLUDE_DIRS})
-target_link_libraries(edcircles PRIVATE ${OpenCV_LIBS})
+target_link_libraries(edcircles PRIVATE ${OpenCV_LIBS} OpenMP::OpenMP_CXX)
+# 原生几何函数要与 numpy 参考实现逐位一致，禁止 FMA 收缩改变舍入。
+set_source_files_properties(edcircles/edcircles_c.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
 set_target_properties(edcircles PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/ringdet/_lib
   CXX_VISIBILITY_PRESET hidden)

@@ -20,8 +20,9 @@ def cross(img, x, y, size, color, th=1):
     cv2.line(img, _p(x, y - size), _p(x, y + size), color, th, cv2.LINE_AA, SHIFT)
 
 
-def text(img, s, org, color=(255, 255, 255), scale=0.6):
-    cv2.putText(img, s, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 3, cv2.LINE_AA)
+def text(img, s, org, color=(255, 255, 255), scale=0.6, th=3):
+    # 阴影用非 AA：1080p 上 7 行文字从 ~6 ms 降到 ~2 ms，正文仍是 AA
+    cv2.putText(img, s, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), th, cv2.LINE_8)
     cv2.putText(img, s, org, cv2.FONT_HERSHEY_SIMPLEX, scale, color, 1, cv2.LINE_AA)
 
 
@@ -34,22 +35,29 @@ def draw_measurement(img, m, color):
     cross(img, m.cx, m.cy, max(3, m.r * 0.3), color)
 
 
-def draw_result(frame, res):
-    img = frame.copy() if frame.ndim == 3 else cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+def draw_result(frame, res, scale=1.0):
+    """scale < 1：直接按显示分辨率绘制（预览用），省掉全图拷贝和事后缩放。"""
+    if scale != 1.0:
+        img = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+    else:
+        img = frame.copy()
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    sp = scale
     d = res.debug
     if res.phase == 'SEARCH' and res.click_px is not None and d.get('region') is not None:
         x0, y0, x1, y1 = d['region']
         if x1 > x0 and y1 > y0:
-            cv2.rectangle(img, (int(x0), int(y0)), (int(x1) - 1, int(y1) - 1), YELLOW, 1)
+            cv2.rectangle(img, (int(x0 * sp), int(y0 * sp)), (int(x1 * sp) - 1, int(y1 * sp) - 1), YELLOW, 1)
     if res.center_px is not None:
-        x, y = res.center_px
+        x, y = res.center_px[0] * sp, res.center_px[1] * sp
         color = GREEN if res.state == 'DETECTED' else ORANGE
         if res.ellipse is not None:
             cx, cy, a, b, ang = res.ellipse
-            cv2.ellipse(img, ((cx, cy), (2 * a, 2 * b), ang), color, 1, cv2.LINE_AA)
+            cv2.ellipse(img, ((cx * sp, cy * sp), (2 * a * sp, 2 * b * sp), ang), color, 1, cv2.LINE_AA)
         else:
-            circle(img, x, y, res.radius_px, color)
-        cross(img, x, y, max(4, res.radius_px * 0.3), color)
+            circle(img, x, y, res.radius_px * sp, color)
+        cross(img, x, y, max(4, res.radius_px * 0.3) * sp, color)
     color = {'DETECTED': GREEN, 'PREDICTED': ORANGE}.get(res.state, RED)
     s = f'#{res.frame_id}  {res.state} / {res.phase}  ID={res.target_id}'
     if d.get('prediction_source') == 'appearance':
@@ -61,58 +69,28 @@ def draw_result(frame, res):
         position = f'Center: ({res.center_px[0]:.1f}, {res.center_px[1]:.1f})  R: {res.radius_px:.1f}px'
     else:
         position = 'Center: --  R: --'
-    if res.age_ms is not None:
+    if res.age_ms is not None and res.state != 'DETECTED':
         position += f'  Last seen: {res.age_ms:.0f}ms'
     lines.append((position, (255, 255, 255)))
     fps = f"{d['fps']:.1f}" if d.get('fps', 0) > 0 else '--'
-    timing = f"Process FPS: {fps}  Core: {d.get('ms', 0):.1f}ms"
+    timing = f"FPS: {fps}  Core: {d.get('ms', 0):.1f}ms"
     if 'frame_age_ms' in d:
         timing += f"  Frame age: {d['frame_age_ms']:.0f}ms"
     elif 'source_fps' in d:
         timing += f"  Video: {d['source_fps']:.1f}fps"
     lines.append((timing, (255, 255, 255)))
     if res.state == 'DETECTED':
-        geometry = (f"Geometry: sectors={res.sectors}/{d.get('verify_sectors', 16)}"
-                    f'  RMS={res.rms_px:.2f}px  Width={res.line_w_px:.1f}px')
-        lines.append((geometry, (255, 255, 255)))
-    flow = 'OK' if res.motion_ok else 'FAIL'
-    scope = 'local' if d.get('local_motion') else 'global'
-    lines.append((f"Flow: {flow} {scope}/{d.get('motion_backend', '--')}"
-                  f"  Inliers={d.get('motion_inliers', 0)}  Err={d.get('motion_error', 0):.1f}px",
-                  (255, 255, 255) if res.motion_ok else ORANGE))
-    score = d.get('target_identity_score') if res.state == 'DETECTED' else d.get('identity_score')
-    identity = f'{score:.2f}' if score is not None else '--'
-    label = 'Identity' if res.state == 'DETECTED' else 'Last ID check'
-    match = d.get('appearance_ncc', d.get('template_score'))
-    ncc = f'{match:.2f}' if match is not None else '--'
-    psr = d.get('appearance_psr', d.get('online_psr', d.get('online_update_psr')))
-    psr = f'{psr:.1f}' if psr is not None else '--'
-    lines.append((f"{label}: {identity}  NCC: {ncc}  PSR: {psr}  Refs: {d.get('reference_count', 0)}",
-                  (255, 255, 255)))
-    age = d.get('online_age_frames')
-    if not d.get('online_enabled'):
-        learning = 'OFF'
-    elif d.get('online_active'):
-        learning = 'UPDATED' if age == 0 else 'FROZEN' if res.phase != 'TRACK' or d.get('template_hold') else 'READY'
-    elif not d.get('reference_count'):
-        learning = 'WAIT LOCK'
-    elif res.radius_px is not None and res.radius_px < d.get('online_min_radius', 8):
-        learning = 'WAIT SIZE'
-    else:
-        learning = 'WAIT QUALITY'
-    lines.append((f"Online CF: {learning}  Updates={d.get('online_updates', 0)}"
-                  f"  Age={str(age) + 'f' if age is not None else '--'}  Hold={d.get('template_hold', 0)}",
-                  (255, 255, 255)))
+        lines.append((f"Ing: sectors={res.sectors}/{d.get('verify_sectors', 16)}"
+                      f'  RMS={res.rms_px:.2f}px', (255, 255, 255)))
     if res.phase in ('SEARCH', 'REACQUIRE'):
-        search = f"Search: raw={len(d.get('found', []))}  candidates={len(d.get('cands', []))}"
+        search = f"Search: candidates={len(d.get('cands', []))}"
         confirmation = d.get('confirmation')
         if confirmation is not None:
-            hits, needed, ed = confirmation
-            search += f"  Confirm={hits}/{needed}  ED={'yes' if ed else 'no'}"
-        if d.get('r_range') is not None:
-            lo, hi = d['r_range']
-            search += f'  R={lo:.1f}..{hi:.1f}'
+            hits, needed, _ = confirmation
+            search += f'  Confirm={hits}/{needed}'
         lines.append((search, YELLOW))
+    if not res.motion_ok:
+        lines.append(('Flow FAIL', ORANGE))
     check = d.get('track_meas')
     if res.ambiguous:
         lines.append(('Check: multiple similar candidates', ORANGE))
@@ -124,13 +102,14 @@ def draw_result(frame, res):
     elif res.phase == 'SEARCH' and res.click_px is None and not d.get('reference_count'):
         lines.append(('Waiting for click', YELLOW))
     H, W = img.shape[:2]
-    scale = max(0.6, W / 1280)
-    font = 0.48 * scale
-    margin, gap = int(round(10 * scale)), int(round(21 * scale))
+    ls = max(0.6, W / 1280)
+    font = 0.48 * ls
+    margin, gap = int(round(10 * ls)), int(round(21 * ls))
     widths = [cv2.getTextSize(s, cv2.FONT_HERSHEY_SIMPLEX, font, 1)[0][0] for s, _ in lines]
     panel_w, panel_h = min(W, max(widths) + 2 * margin), min(H, len(lines) * gap + margin)
     panel = img[:panel_h, :panel_w]
-    cv2.addWeighted(panel, 0.35, panel * 0, 0.65, 0, dst=panel)
+    cv2.multiply(panel, 0.35, dst=panel, dtype=cv2.CV_8U)
+    th = max(1, int(round(3 * sp)))
     for row, (s, tint) in enumerate(lines):
-        text(img, s, (margin, margin + (row + 1) * gap - int(5 * scale)), tint, font)
+        text(img, s, (margin, margin + (row + 1) * gap - int(5 * ls)), tint, font, th)
     return img

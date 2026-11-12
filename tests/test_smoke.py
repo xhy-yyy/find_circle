@@ -307,6 +307,41 @@ def test_stable_track_waits_through_brief_blur_without_outputting_a_position(mon
     tracker.close()
 
 
+def test_stable_template_grace_keeps_geometry_checks_and_expires(monkeypatch):
+    import ringdet.tracker as tracker_module
+    from ringdet.motion import Motion
+    from ringdet.verify import Measurement
+
+    params = Params()
+    params.track.stable_template_grace_s = .075
+    tracker = RingTracker(params, Camera.default(320, 180))
+    tracker.phase = 'TRACK'
+    tracker.tgt = [160., 90., 12.]
+    tracker.last_detect = 0.
+    tracker.stable_track_hits = params.track.stable_track_frames
+    image = np.zeros((180, 320), np.uint8)
+    motion = Motion(np.float64([[1, 0, 0], [0, 1, 0]]), 80)
+    monkeypatch.setattr(tracker.motion, 'update', lambda _: motion)
+    checked = []
+    matched = []
+
+    def verify(*_args, **_kwargs):
+        checked.append(tracker.n_frames)
+        return Measurement(False, 'few_valid')
+
+    monkeypatch.setattr(tracker_module, 'measure_channels', verify)
+    monkeypatch.setattr(tracker, '_template_measure', lambda *_: matched.append(tracker.n_frames))
+    try:
+        for i in (1, 2):
+            result = tracker.process(image, i / 30, i)
+            assert result.state == 'PREDICTED' and result.center_px == (160., 90.)
+        assert matched == []
+        tracker.process(image, .1, 3)
+        assert checked == [1, 2, 3] and matched == [3]
+    finally:
+        tracker.close()
+
+
 def test_broken_motion_chain_requires_identity_and_expires(monkeypatch):
     from ringdet.motion import Motion
     rng = np.random.default_rng(35)
@@ -578,6 +613,53 @@ def test_expensive_template_cannot_starve_search_or_timeout(monkeypatch):
     tracker.close()
 
 
+def test_pending_search_verifies_before_fft_even_after_budget(monkeypatch):
+    from types import SimpleNamespace
+    import ringdet.tracker as tracker_module
+    from ringdet.search import Candidate
+    from ringdet.verify import Measurement
+
+    params = Params()
+    params.search.verify_pending_first = True
+    params.search.use_edcircles = False
+    params.search.ed_local = False
+    tracker = RingTracker(params, Camera.default(320, 180))
+    tracker.set_click(160, 90)
+    image = synth.ground_texture(180, 320, np.random.default_rng(42)).astype(np.uint8)
+    clock = [0.0]
+    calls = []
+
+    def generate(*_):
+        calls.append('fft')
+        clock[0] += .04
+        return [Candidate(160., 90., 12., 8., 0)]
+
+    def motion(_):
+        if calls:
+            clock[0] += .035
+
+    def verify(_frame, _camera, x, y, r, *_args, **_kwargs):
+        calls.append('verify')
+        return Measurement(True, '', x, y, r)
+
+    monkeypatch.setattr(tracker_module, 'time', SimpleNamespace(perf_counter=lambda: clock[0]))
+    monkeypatch.setattr(tracker_module, 'measure_channels', verify)
+    monkeypatch.setattr(tracker.searcher, 'run', generate)
+    monkeypatch.setattr(tracker.motion, 'update', motion)
+    try:
+        result = tracker.process(image, 0.0, 0)
+        assert result.state == 'LOST' and len(tracker.pending) == 1
+        assert calls == ['fft']
+        for i in range(1, params.track.identity_init_hits + 1):
+            clock[0] = i * .1
+            result = tracker.process(image, i / 30, i)
+            assert result.state == ('DETECTED' if i == params.track.identity_init_hits else 'LOST')
+        assert result.center_px == (160., 90.)
+        assert calls == ['fft'] + ['verify'] * params.track.identity_init_hits
+    finally:
+        tracker.close()
+
+
 def test_pending_recovery_cannot_bypass_confirmation(monkeypatch):
     rng = np.random.default_rng(42)
     image = synth.ground_texture(360, 640, rng)
@@ -701,15 +783,52 @@ def test_click_locks_small_ring_without_descent(offset, height):
     assert tracker.online is None
 
 
+@pytest.mark.parametrize('geometry_hits', [0, 8])
 @pytest.mark.parametrize('seed', [52, 53, 54])
-def test_static_clutter_near_click_does_not_lock(seed):
+def test_static_clutter_near_click_does_not_lock(seed, geometry_hits):
     rng = np.random.default_rng(seed)
     image, _ = synth.scene(rng, size=(640, 360), r=6, ring=False)
-    tracker = RingTracker(Params(), Camera.default(640, 360))
+    params = Params()
+    params.track.small_ring_geometry_hits = geometry_hits
+    tracker = RingTracker(params, Camera.default(640, 360))
     tracker.set_click(320, 180)
     for i in range(12):
         frame = np.clip(image.astype(np.int16) + rng.integers(-1, 2, image.shape), 0, 255).astype(np.uint8)
         assert tracker.process(frame, i / 30, i).state == 'LOST'
+
+
+def test_small_ring_without_ed_requires_consecutive_strong_geometry(monkeypatch):
+    import ringdet.tracker as tracker_module
+    from ringdet.motion import Motion
+    from ringdet.search import Candidate
+    from ringdet.verify import Measurement
+
+    params = Params()
+    params.track.small_ring_geometry_hits = 8
+    params.track.frame_budget_ms = 1000
+    params.search.budget_ms = 1000
+    tracker = RingTracker(params, Camera.default(320, 180))
+    tracker.set_click(160, 90)
+    frame = np.zeros((180, 320), np.uint8)
+    identity = Motion(np.float64([[1, 0, 0], [0, 1, 0]]), 80)
+    monkeypatch.setattr(tracker.motion, 'update', lambda _: identity)
+    monkeypatch.setattr(tracker.searcher, 'run', lambda *_: [Candidate(160., 90., 6., 8., 0)])
+    monkeypatch.setattr(tracker, '_submit_ed', lambda *_: False)
+    monkeypatch.setattr(tracker, '_reference_score', lambda *_: .98)
+    monkeypatch.setattr(tracker_module, 'ed_support', lambda *_: False)
+
+    def measure(*_args, **_kwargs):
+        rms = .5 if tracker.n_frames == 4 else .2
+        return Measurement(True, '', 160., 90., 6., sectors=16, inlier_ratio=1., rms=rms, line_w=1.)
+
+    monkeypatch.setattr(tracker_module, 'measure_channels', measure)
+    try:
+        for i in range(11):
+            assert tracker.process(frame, i / 30, i).state == 'LOST'
+        result = tracker.process(frame, 11 / 30, 11)
+        assert result.state == 'DETECTED' and result.center_px == (160., 90.)
+    finally:
+        tracker.close()
 
 
 def test_learned_motion_supports_tracking_without_optical_flow(monkeypatch):
@@ -756,6 +875,37 @@ def test_protected_memory_recovers_when_working_template_is_unusable(monkeypatch
     assert result.target_id == 1
     assert math.dist(result.center_px, (390, 180)) < 1.5
     np.testing.assert_array_equal(tracker.references[0]['image'], reference)
+
+
+def test_recovery_uses_local_window_only_with_recent_reliable_motion(monkeypatch):
+    from ringdet.frame import Frame
+
+    params = Params()
+    params.track.recovery_local_s = .12
+    tracker = RingTracker(params, Camera.default(480, 360))
+    tracker.tgt = [240., 180., 8.]
+    tracker.last_detect = 0.
+    template = np.random.default_rng(42).integers(0, 256, (41, 41), dtype=np.uint8)
+    tracker.template = dict(image=template, size=41, r=8.)
+    tracker.ambiguous = False
+    frame = Frame(np.zeros((360, 480), np.uint8), 2.)
+    shapes = []
+
+    def match(roi, patches, **_):
+        shapes.append(roi.shape)
+        return [(0., 1., []) for _ in patches]
+
+    monkeypatch.setattr(tracker, '_match_templates', match)
+    try:
+        for i, (stamp, motion_ok) in enumerate(((.05, True), (.05, False), (.15, True)), start=1):
+            tracker.n_frames = i
+            tracker.dbg = dict(motion_ok=motion_ok, motion_error=.5)
+            assert tracker._template_measure(frame, stamp) is None
+        assert max(shapes[0]) < 128
+        assert min(shapes[1]) >= params.track.reacq_box_min
+        assert min(shapes[2]) >= params.track.reacq_box_min
+    finally:
+        tracker.close()
 
 
 def test_online_recovery_works_without_template_search(monkeypatch):
@@ -924,7 +1074,7 @@ def test_native_ellipse_preserves_measurement(monkeypatch):
     image = synth.degrade(image, rng, blur=.5, noise=1)
     args = (image.astype(np.float32), Camera.default(360, 240), 180, 120, 20, 2, Params().verify)
     accelerated = verify.measure(*args)
-    monkeypatch.setattr(verify, 'ellipse_hypotheses', lambda *_: None)
+    monkeypatch.setattr(verify, 'ellipse_fit', lambda *_: None)
     reference = verify.measure(*args)
     assert accelerated.ok and reference.ok and accelerated.ellipse is not None
     np.testing.assert_allclose(accelerated.ellipse, reference.ellipse, atol=1e-4)
@@ -983,6 +1133,19 @@ def test_native_verification_preserves_decision_and_center(ellipse):
                                (reference.cx, reference.cy, reference.r, reference.rms), atol=1e-7)
 
 
+def test_cached_circle_samples_preserve_rng_sequence():
+    from ringdet.verify import _circle_samples
+    generator = np.random.default_rng(93)
+    generator.integers(0, 17)
+    state = generator.bit_generator.state
+    expected = np.argsort(generator.random((100, 64)), axis=1)[:, :3]
+    for _ in range(2):
+        samples, end_state = _circle_samples(64, 100, state['state']['state'], state['state']['inc'],
+                                             state['has_uint32'], state['uinteger'])
+        np.testing.assert_array_equal(samples, expected)
+        assert end_state == generator.bit_generator.state
+
+
 def test_cached_ellipse_samples_preserve_rng_sequence():
     from ringdet.verify import _ellipse_samples
     for n in (24, 64, 128):
@@ -1019,7 +1182,7 @@ def test_cpu_compact_matches_preserve_original_peaks():
         assert peaks == expected
 
 
-@pytest.mark.parametrize('case', ['normal', 'tie', 'unsupported', 'nonfinite', 'low_variance'])
+@pytest.mark.parametrize('case', ['normal', 'tie', 'unsupported', 'nonfinite', 'low_variance', 'nano_fixed'])
 def test_gpu_compact_matching_preserves_peaks_and_fallback(monkeypatch, case):
     uploads, downloads = [], []
 
@@ -1083,15 +1246,18 @@ def test_gpu_compact_matching_preserves_peaks_and_fallback(monkeypatch, case):
     for name, operation in operations.items():
         monkeypatch.setattr(cv2.cuda, name, operation, raising=False)
     rng = np.random.default_rng(95)
-    roi = rng.integers(0, 256, (180, 240), dtype=np.uint8)
+    roi_shape = (320, 320) if case == 'nano_fixed' else (180, 240)
+    roi = rng.integers(0, 256, roi_shape, dtype=np.uint8)
     template = roi[40:65, 55:80].copy()
     copied = template.astype(np.int16)
     if case != 'tie':
         copied += rng.integers(-25, 26, copied.shape)
     roi[110:135, 170:195] = np.clip(copied, 0, 255).astype(np.uint8)
-    params = Params()
+    params = (Params.load(os.path.join(os.path.dirname(__file__), '..', 'orin_nano_8gb.yaml'))
+              if case == 'nano_fixed' else Params())
     params.motion.backend = 'cpu'
-    params.track.template_backend = 'cuda'
+    if case != 'nano_fixed':
+        params.track.template_backend = 'cuda'
     tracker = RingTracker(params)
     expected = cv2.matchTemplate(roi, template, cv2.TM_CCOEFF_NORMED)
     if case == 'nonfinite':
@@ -1114,10 +1280,14 @@ def test_gpu_compact_matching_preserves_peaks_and_fallback(monkeypatch, case):
             assert actual_std == pytest.approx(deviation[0, 0], abs=1e-8)
             assert peaks == expected_peaks
     assert uploads.count(template.shape) == 1
-    assert sum(downloads) == (4 if case in ('tie', 'unsupported', 'low_variance') else 0)
+    assert sum(downloads) == (4 if case in ('tie', 'unsupported', 'low_variance', 'nano_fixed') else 0)
     if case == 'normal':
         tracker.warmup()
         assert set(tracker._gpu_peak_routes) == {0, 1, 2}
+    if case == 'nano_fixed':
+        tracker.warmup()
+        assert not tracker._gpu_peak_routes
+        assert tracker.template_backend == 'cuda' and tracker.template_peak_backend == 'cpu'
     tracker._gpu_peak_routes = {0: False, 1: False, 2: False}
     summary = tracker._match_templates(roi, [template], peak_radius=8)[0]
     assert summary[2] == expected_peaks
@@ -1133,6 +1303,34 @@ def test_cuda_auto_falls_back_without_device(monkeypatch):
     params.motion.backend = 'cuda'
     with pytest.raises(RuntimeError, match='CUDA'):
         GroundMotion(params.motion)
+
+
+def test_nano_profile_preserves_detection_parameters():
+    from dataclasses import asdict
+    path = os.path.join(os.path.dirname(__file__), '..', 'orin_nano_8gb.yaml')
+    expected = asdict(Params())
+    actual = asdict(Params.load(path))
+    expected['track']['compact_gpu_matching'] = False
+    expected['track']['stable_template_grace_s'] = .075
+    expected['track']['identity_every'] = 3
+    expected['track'].update(template_cuda_min_area=90000, recovery_local_s=.12, small_ring_geometry_hits=8)
+    expected['search'].update(radii_per_job=2, click_focus_half=240, click_focus_radii_per_job=6, verify_pending_first=True)
+    assert actual == expected
+
+
+def test_auto_template_falls_back_independently_of_motion(monkeypatch):
+    params = Params()
+    params.motion.backend = 'cpu'
+    monkeypatch.setattr(cv2.cuda, 'getCudaEnabledDeviceCount', lambda: 1)
+    monkeypatch.setattr(cv2.cuda, 'createTemplateMatching', None, raising=False)
+    tracker = RingTracker(params)
+    roi = np.random.default_rng(98).integers(0, 256, (180, 240), dtype=np.uint8)
+    template = roi[30:55, 40:65].copy()
+    response = tracker._match_templates(roi, [template])[0]
+    assert tracker.motion.backend == tracker.template_backend == 'cpu'
+    assert tracker.template_backend_error and tracker._gpu_matcher is False
+    np.testing.assert_allclose(response, cv2.matchTemplate(roi, template, cv2.TM_CCOEFF_NORMED), atol=2e-4)
+    tracker.close()
 
 
 @pytest.mark.skipif(cv2.cuda.getCudaEnabledDeviceCount() == 0 or not (

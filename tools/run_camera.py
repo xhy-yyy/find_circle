@@ -205,7 +205,9 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, W)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, H)
     cap.set(cv2.CAP_PROP_FPS, a.fps)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    # 只留 1 个缓冲时，取帧/还帧之间驱动放不下下一帧，会隔一帧丢一帧（实测只剩 15 fps）。
+    # 2 个缓冲即可恢复 29.9 fps，代价只是最多多 1 帧延迟。
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
     if not cap.isOpened():
         sys.exit(f'打不开相机 {a.dev}')
     rw, rh = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))

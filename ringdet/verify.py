@@ -13,7 +13,7 @@ from typing import Optional, Tuple
 import numpy as np
 import cv2
 
-from .edcircles import ellipse_hypotheses, huber_circle, ray_scores
+from .edcircles import ellipse_fit, huber_circle, peak_pick, ransac_circle, ray_scores
 
 
 @dataclass
@@ -85,7 +85,10 @@ def _ray_scores(gray, cx, cy, r, delta, n_rays, V, r_ray=None):
     prof = cv2.remap(gray, xs, ys, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
     iw = np.nonzero((s >= -delta) & (s <= delta))[0]
     n = len(s)
-    scores = ray_scores(prof, iw, widths, step, V.gap, V.side_ratio) if V.backend != 'python' else None
+    scores = ray_scores(prof, iw, widths, step, V.gap, V.side_ratio, inside) if V.backend != 'python' else None
+    meds = None
+    if scores is not None:
+        scores, meds = scores
     cs = None
     if scores is None:
         cs = np.zeros((n_rays, len(s) + 1), np.float64)
@@ -107,7 +110,8 @@ def _ray_scores(gray, cx, cy, r, delta, n_rays, V, r_ray=None):
         sc = np.minimum(a, b)
         sc[np.abs(a - b) > V.side_ratio * np.maximum(sc, 0)] = 0.0
         scores.append(sc)
-    return dict(thetas=th, ct=ct, st=st, s=s, iw=iw, inside=inside, scores=scores, widths=widths, r_ray=rr)
+    return dict(thetas=th, ct=ct, st=st, s=s, iw=iw, inside=inside, scores=scores, widths=widths,
+                r_ray=rr, meds=meds)
 
 
 def _circle3(p):
@@ -154,13 +158,33 @@ def _huber_circle(pts, c, r, delta, iters=10, native=True):
     return c, float(r)
 
 
+@lru_cache(maxsize=256)
+def _circle_samples(n, iters, state, increment, has_uint32, uinteger):
+    generator = np.random.Generator(np.random.PCG64())
+    generator.bit_generator.state = dict(bit_generator='PCG64', state=dict(state=state, inc=increment),
+                                        has_uint32=has_uint32, uinteger=uinteger)
+    samples = np.argsort(generator.random((iters, n)), axis=1)[:, :3].copy()
+    samples.setflags(write=False)
+    return samples, generator.bit_generator.state
+
+
 def _fit_circle(pts, tau, iters, rng, r_lim, native=True):
     """RANSAC 粗筛 + Huber 精修。r_lim=(lo, hi) 之外的假设不考虑。
     返回 (center, r, inlier_mask) 或 None。"""
     n = len(pts)
     if n < 5:
         return None
-    idx = np.argsort(rng.random((iters, n)), axis=1)[:, :3]   # 每行 3 个不重复下标
+    if native and type(rng.bit_generator) is np.random.PCG64:
+        state = rng.bit_generator.state
+        idx, end_state = _circle_samples(n, iters, state['state']['state'], state['state']['inc'],
+                                         state['has_uint32'], state['uinteger'])
+        rng.bit_generator.state = end_state
+    else:
+        idx = np.argsort(rng.random((iters, n)), axis=1)[:, :3]
+    if native:
+        fitted = ransac_circle(pts, idx, tau, r_lim[0], r_lim[1])
+        if fitted is not False:
+            return fitted
     c, rr = _circle3(pts[idx])
     ok = np.isfinite(rr) & (rr >= r_lim[0]) & (rr <= r_lim[1])
     if not ok.any():
@@ -229,22 +253,29 @@ def _peaks(gray, cx, cy, r, delta, noise, V, r_ray=None):
         m.reason = 'outside'
         return m, None, None, None, n_rays
     # 所有射线用同一档线宽：取"各射线最高分"中位数最大的那档
-    meds = [np.median(sc[inside].max(1)) for sc in d['scores']]
+    if d['meds'] is None:
+        meds = [np.median(sc[inside].max(1)) for sc in d['scores']]
+    else:
+        meds = d['meds']
     j = int(np.argmax(meds))
     sc = d['scores'][j]
-    k = np.argmax(sc, 1)
-    rows = np.arange(n_rays)
-    peak = sc[rows, k]
-    # 抛物线亚像素
-    km, kp = np.clip(k - 1, 0, sc.shape[1] - 1), np.clip(k + 1, 0, sc.shape[1] - 1)
-    y0, y1, y2 = sc[rows, km], peak, sc[rows, kp]
-    den = y0 - 2 * y1 + y2
-    with np.errstate(divide='ignore', invalid='ignore'):
-        off = np.where((den < 0) & (k > 0) & (k < sc.shape[1] - 1), 0.5 * (y0 - y2) / den, 0.0)
-    off = np.clip(off, -0.5, 0.5)
-    dist = d['r_ray'] + d['s'][d['iw'][k]] + off * V.step
     thr = max(V.k_sigma * noise, V.min_contrast)
-    valid = inside & (peak >= thr)
+    picked = peak_pick(sc, d['r_ray'], d['s'][d['iw']], V.step, thr, inside) if V.backend != 'python' else None
+    if picked is not None:
+        _, peak, dist, valid = picked
+    else:
+        k = np.argmax(sc, 1)
+        rows = np.arange(n_rays)
+        peak = sc[rows, k]
+        # 抛物线亚像素
+        km, kp = np.clip(k - 1, 0, sc.shape[1] - 1), np.clip(k + 1, 0, sc.shape[1] - 1)
+        y0, y1, y2 = sc[rows, km], peak, sc[rows, kp]
+        den = y0 - 2 * y1 + y2
+        with np.errstate(divide='ignore', invalid='ignore'):
+            off = np.where((den < 0) & (k > 0) & (k < sc.shape[1] - 1), 0.5 * (y0 - y2) / den, 0.0)
+        off = np.clip(off, -0.5, 0.5)
+        dist = d['r_ray'] + d['s'][d['iw'][k]] + off * V.step
+        valid = inside & (peak >= thr)
     m.n_valid = int(valid.sum())
     m.line_w = d['widths'][j]
     if m.n_valid < 8:
@@ -317,9 +348,8 @@ def _ellipse_pass(gray, cam, m0, noise, V, rng):
         if px is None or len(px) < 12:
             return best
         pu = cam.undistort(px)
-        # RANSAC：5 点椭圆，取内点最多的
+        # RANSAC：5 点椭圆，取内点最多的；原生路径把内点精修也一次算完
         tau = max(V.inlier_tol[0], V.inlier_tol[1] * m0.r)
-        best_inl, best_e = None, None
         n = len(pu)
         if V.backend != 'python' and type(rng.bit_generator) is np.random.PCG64:
             state = rng.bit_generator.state
@@ -328,34 +358,39 @@ def _ellipse_pass(gray, cam, m0, noise, V, rng):
             rng.bit_generator.state = end_state
         else:
             samples = np.array([rng.choice(n, 5, replace=False) for _ in range(60)], np.int32)
-        native = ellipse_hypotheses(pu, samples, m0.r, tau, V.ellipse_min_axis_ratio)
+        native = ellipse_fit(pu, samples, m0.r, tau, V.ellipse_min_axis_ratio) if V.backend != 'python' else None
         if native is not None:
-            best_e, best_inl = native
-        for idx in samples if native is None else ():
-            try:
-                (ex, ey), (d1, d2), ang = cv2.fitEllipseDirect(pu[idx].astype(np.float32))
-            except cv2.error:
-                continue
-            a, b = d1 / 2, d2 / 2
-            if not (np.isfinite(a) and np.isfinite(b)) or min(a, b) < 0.5 * m0.r or max(a, b) > 1.6 * m0.r:
-                continue
-            if min(a, b) / max(a, b) < V.ellipse_min_axis_ratio:
-                continue
-            inl = np.abs(_ellipse_residual(pu, ex, ey, a, b, ang)) <= tau
-            if best_inl is None or inl.sum() > best_inl.sum():
-                best_inl, best_e = inl, (ex, ey, a, b, ang)
-        if best_inl is None or best_inl.sum() < 12:
-            return best
-        # 内点上最小二乘精修两次
-        inl = best_inl
-        for _ in range(2):
-            (ex, ey), (d1, d2), ang = cv2.fitEllipseDirect(pu[inl].astype(np.float32))
-            a, b = d1 / 2, d2 / 2
-            if min(a, b) <= 0 or min(a, b) / max(a, b) < V.ellipse_min_axis_ratio:
+            rc, best_e, inl = native
+            if rc < 12:              # 没有合格假设（<12 内点）或精修失败：沿用上一轮结果
                 return best
-            inl = np.abs(_ellipse_residual(pu, ex, ey, a, b, ang)) <= tau
-            if inl.sum() < 12:
+            ex, ey, a, b, ang = best_e
+        else:
+            best_inl = None
+            for idx in samples:
+                try:
+                    (ex, ey), (d1, d2), ang = cv2.fitEllipseDirect(pu[idx].astype(np.float32))
+                except cv2.error:
+                    continue
+                a, b = d1 / 2, d2 / 2
+                if not (np.isfinite(a) and np.isfinite(b)) or min(a, b) < 0.5 * m0.r or max(a, b) > 1.6 * m0.r:
+                    continue
+                if min(a, b) / max(a, b) < V.ellipse_min_axis_ratio:
+                    continue
+                inl = np.abs(_ellipse_residual(pu, ex, ey, a, b, ang)) <= tau
+                if best_inl is None or inl.sum() > best_inl.sum():
+                    best_inl = inl
+            if best_inl is None or best_inl.sum() < 12:
                 return best
+            # 内点上最小二乘精修两次
+            inl = best_inl
+            for _ in range(2):
+                (ex, ey), (d1, d2), ang = cv2.fitEllipseDirect(pu[inl].astype(np.float32))
+                a, b = d1 / 2, d2 / 2
+                if min(a, b) <= 0 or min(a, b) / max(a, b) < V.ellipse_min_axis_ratio:
+                    return best
+                inl = np.abs(_ellipse_residual(pu, ex, ey, a, b, ang)) <= tau
+                if inl.sum() < 12:
+                    return best
         res = _ellipse_residual(pu[inl], ex, ey, a, b, ang)
         m.rms = float(np.sqrt(np.mean(res ** 2)))
         m.r = float((a + b) / 2)
