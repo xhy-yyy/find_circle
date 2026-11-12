@@ -78,7 +78,7 @@ CALIB=cam.yaml UDP_OUT=地面站IP:9000 LISTEN=9001 ./run.sh camera
 
 默认保持摄像头原有曝光和对焦设置。曾设置手动曝光、需要恢复自动时，运行 `EXPOSURE=auto ./run.sh camera`。户外需要限制运动拖影时，可用 `EXPOSURE=20 ./run.sh camera` 显式设置 2 ms 手动曝光，并根据画面亮度调试。数字曝光值的单位是 100 µs；控件名称以 `v4l2-ctl -l` 为准。
 
-Jetson Orin Nano 更新代码后先运行 `./build.sh`，在板端编译 CPU 金字塔复用和椭圆假设验证函数。Python OpenCV 与 C++ OpenCV 应使用同一套安装，不能复制电脑上的 `.so` 到板端。CUDA 需要 OpenCV 实际编译相应模块，仅安装 CUDA 驱动不会自动启用这些接口。
+Jetson Orin Nano 更新代码后先运行 `./build.sh`，在板端编译 CPU 金字塔复用、射线评分、圆心精修和椭圆假设验证函数。Python OpenCV 与 C++ OpenCV 应使用同一套安装，不能复制电脑上的 `.so` 到板端。CUDA 需要 OpenCV 实际编译相应模块，仅安装 CUDA 驱动不会自动启用这些接口。
 
 ```bash
 SHOW=1 ./run.sh camera --threads 4 --set motion.backend=auto --stats --quiet
@@ -90,6 +90,10 @@ REC_DIR="" ./run.sh camera                      # 关闭录像和文件日志
 香橙派使用相同代码，在板端重新编译后运行 `SHOW=1 ./run.sh camera --threads 4 --set motion.backend=cpu --set track.template_backend=cpu --stats --quiet`。RK3588 的 GPU 不使用 CUDA，当前走 CPU 加速路径。两块板都保留摄像头原有曝光设置；对比性能时保持分辨率、录像、预览配置一致，可分别比较 `--threads 2` 和 `--threads 4`。
 
 `auto` 默认尝试 CUDA，设备或接口不可用时回退 CPU；启动时打印运动估计和重捕匹配的实际后端。较大的重捕图块支持 CUDA 归一化互相关，缺少模块时回退 CPU 的共享 FFT 路径；`--set track.template_backend=cpu` 可单独关闭 GPU 匹配。区域 ED 搜索默认在单个后台线程执行，候选经有效运动链补偿后仍须在当前原图复核；运动链失效、超过 0.25 s 或重新点击时丢弃。处理帧采用 28 ms 软预算，完整重捕验证和单次几何复核仍可能超时，这不是已验证的板端 30 FPS 保证。
+
+几何复核默认在 CPU 原生库中计算多档射线评分与双精度圆心精修；椭圆随机样本按生成器完整状态缓存，样本及后续随机状态与原路径一致。搜索范围、随机假设数、几何／身份门限、确认帧数和学习规则沿用原配置。`--set verify.backend=python` 可切回原有评分、精修和采样路径作对照；库未更新或相应函数不可用时自动回退。
+
+GPU 匹配缓存最多 32 个模板，缓存图像数据不超过 16 MiB，并复用响应缓冲区。启动预热时按小、中、大响应区域比较“GPU 峰值筛选”和“下载响应图后 CPU 筛选”的完整耗时，仅启用结果一致且实测更快的路径。GPU 筛选只返回前两个峰、均值和标准差；同分峰、低方差、PSR 临界值或接口不支持时沿用原响应图筛选。启动日志显示各区域的分配；`--set track.compact_gpu_matching=false` 可关闭 GPU 峰值筛选，保留 GPU 匹配和缓存。EDCircles、在线滤波、身份确认与状态机继续使用 CPU。
 
 相机录像使用有界后台队列，不阻塞识别；安装 `ffmpeg` 且相机后端支持原始 MJPEG 时直接保存压缩码流，否则后台编码。`--record-mode encode` 可固定使用编码路径，结束时显示写入与丢弃帧数。预览默认 15 FPS，识别仍逐帧处理；可用 `--display-fps 30` 提高预览刷新率。启动会预热常用滤波核和 CUDA 接口。
 
@@ -154,6 +158,7 @@ verify:
 | `motion.backend` | auto | auto / cpu / cuda，auto 在 CUDA 不可用时回退 CPU |
 | `motion.refresh_frames` | 8 | 定期刷新角点；数量或局部覆盖不足时提前刷新 |
 | `track.frame_budget_ms` | 28 | 含光流和预处理的整帧软预算（ms） |
+| `verify.backend` | auto | CPU 原生射线评分、圆心精修及等价样本缓存；python 使用原路径 |
 | `verify.lock_sectors` | 14 | 首锁扇区下限（满 16）。漏检多可降到 13，误检会增加 |
 | `track.confirm_hits` / `track.identity_init_hits` | 3 / 6 | 首锁取两者较大值，确认窗口至少为首次建档帧数加 2 |
 | `track.coast_s` | 0.3 | 测不到时最多预测多久 |
@@ -163,6 +168,7 @@ verify:
 | `track.reacq_box_min` | 240 | 小圆环的重捕搜索框最小边长（原图 px） |
 | `track.template_score` | 0.65 | 局部外观匹配阈值；通过后仍须圆环几何复核 |
 | `track.template_backend` | auto | auto / cpu / cuda，auto 对较大重捕图块优先使用可用的 CUDA 模板匹配 |
+| `track.compact_gpu_matching` | true | 允许预热时按响应区域实测分配峰值筛选；false 保留响应图回传到 CPU 的路径 |
 | `track.identity_score` | 0.80 | 重捕身份分；较弱结果须达到 `template_score - 0.15`，通过首锁几何门限并延长确认 |
 | `track.identity_margin` | 0.06 | 两个重捕候选的身份分差不足时暂不接回 |
 | `track.reacq_confirm_hits` / `track.reacq_weak_hits` | 3 / 5 | 重捕的连续确认帧数，分别用于身份明确和较弱的结果 |

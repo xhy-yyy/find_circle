@@ -68,6 +68,7 @@ class SearchParams:
 
 @dataclass
 class VerifyParams:
+    backend: str = 'auto'        # auto / python；原生计算不可用时保留 Python 路径
     rays_small: int = 64
     rays_large: int = 128
     rays_large_r: float = 30.0   # 半径 >= 它用 rays_large 条射线
@@ -156,6 +157,7 @@ class TrackParams:
     learn_rate: float = 0.15     # 可靠测量的工作模板、形状和运动统计更新率
     frame_budget_ms: float = 28.0  # 包含预处理和光流的整帧软预算
     template_backend: str = 'auto'  # auto / cpu / cuda；CUDA 用于较大的重捕图块
+    compact_gpu_matching: bool = True
     online_learning: bool = True   # 背景感知相关滤波，只产生重捕候选
     online_min_radius: float = 8.0  # 小于此像素半径保留原像素模板路径
     online_update_frames: int = 3  # 可靠帧之间的最小滤波器更新间隔

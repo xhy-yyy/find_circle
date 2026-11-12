@@ -235,7 +235,12 @@ def main():
     print(f'运动估计：{trk.motion.backend}，CPU 线程数 {cv2.getNumThreads()}', file=sys.stderr)
     if trk.motion.backend_error:
         print(f'[CUDA] {trk.motion.backend_error}', file=sys.stderr)
-    print(f'重捕匹配：{trk.template_backend}', file=sys.stderr)
+    print(f'重捕匹配：{trk.template_backend}，峰值筛选：{trk.template_peak_backend}', file=sys.stderr)
+    if trk.template_peak_error:
+        print(f'[GPU 峰值筛选回退 CPU] {trk.template_peak_error}', file=sys.stderr)
+    if trk._gpu_peak_routes:
+        print('峰值筛选分配：' + '，'.join(f'{size}={"cuda" if trk._gpu_peak_routes.get(i, False) else "cpu"}'
+              for i, size in enumerate(('小区域', '中区域', '大区域'))), file=sys.stderr)
     print('在线滤波：' + (f'CPU 背景感知相关滤波，半径至少 {P.track.online_min_radius:g} px'
                           if P.track.online_learning else '关闭，使用像素模板'), file=sys.stderr)
     if trk.template_backend_error:

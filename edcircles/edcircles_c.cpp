@@ -99,6 +99,81 @@ EDC_API int edc_flow_fb(const uint8_t* prev, const uint8_t* current,
     }
 }
 
+EDC_API int edc_huber_circle(const double* points, int count, double* circle,
+                            double delta, int iterations) {
+    if (!points || !circle || count < 3 || iterations < 0 || delta <= 0) return -1;
+    try {
+        double cx = circle[0], cy = circle[1], radius = circle[2];
+        for (int k = 0; k < iterations; ++k) {
+            cv::Matx33d normal = cv::Matx33d::zeros();
+            cv::Vec3d rhs(0, 0, 0);
+            for (int i = 0; i < count; ++i) {
+                double dx = points[2 * i] - cx, dy = points[2 * i + 1] - cy;
+                double distance = std::max(std::hypot(dx, dy), 1e-9);
+                double residual = distance - radius;
+                double weight = std::abs(residual) <= delta ? 1.0 : delta / std::max(std::abs(residual), 1e-12);
+                cv::Vec3d jacobian(-dx / distance, -dy / distance, -1);
+                for (int a = 0; a < 3; ++a) {
+                    double weighted = jacobian[a] * weight;
+                    rhs[a] += weighted * residual;
+                    for (int b = 0; b < 3; ++b) normal(a, b) += weighted * jacobian[b];
+                }
+            }
+            for (int a = 0; a < 3; ++a) normal(a, a) += 1e-9;
+            cv::Vec3d step;
+            if (!cv::solve(normal, -rhs, step, cv::DECOMP_LU)) break;
+            cx += step[0]; cy += step[1]; radius += step[2];
+            if (std::max({std::abs(step[0]), std::abs(step[1]), std::abs(step[2])}) < 1e-4) break;
+        }
+        circle[0] = cx; circle[1] = cy; circle[2] = radius;
+        return 0;
+    } catch (...) {
+        return -1;
+    }
+}
+
+EDC_API int edc_ray_scores(const double* profiles, int rays, int samples,
+                          const int32_t* positions, int count, const double* widths, int width_count,
+                          double step, double gap, double side_ratio, double* scores) {
+    if (!profiles || !positions || !widths || !scores || rays <= 0 || samples < 2
+            || count <= 0 || width_count <= 0 || step <= 0) return -1;
+    try {
+        thread_local std::vector<double> sums;
+        sums.resize(static_cast<size_t>(rays) * (samples + 1));
+        for (int j = 0; j < rays; ++j) {
+            double* row = sums.data() + j * (samples + 1);
+            row[0] = 0;
+            for (int i = 0; i < samples; ++i) row[i + 1] = row[i] + profiles[j * samples + i];
+        }
+        for (int k = 0; k < width_count; ++k) {
+            double width = widths[k];
+            int nb = 2 * static_cast<int>(std::floor(width / (2 * step))) + 1;
+            int ng = static_cast<int>(std::floor(gap / step + 0.5));
+            int nl = std::max(2, static_cast<int>(std::floor(std::max(2.0, 0.5 * width) / step + 0.5)));
+            if (nb > samples || nl > samples) return -1;
+            for (int j = 0; j < rays; ++j) {
+                const double* row = sums.data() + j * (samples + 1);
+                auto average = [&](int first, int length) {
+                    first = std::max(0, std::min(first, samples - length));
+                    return (row[first + length] - row[first]) / length;
+                };
+                for (int i = 0; i < count; ++i) {
+                    int first = positions[i] - nb / 2;
+                    double line = average(first, nb);
+                    double a = line - average(first - ng - nl, nl);
+                    double b = line - average(first + nb + ng, nl);
+                    double score = std::min(a, b);
+                    if (std::abs(a - b) > side_ratio * std::max(score, 0.0)) score = 0;
+                    scores[(k * rays + j) * count + i] = score;
+                }
+            }
+        }
+        return 0;
+    } catch (...) {
+        return -1;
+    }
+}
+
 EDC_API int edc_ellipse_hypotheses(const double* points, int count, const int32_t* samples,
                                  int iterations, double radius, double tolerance,
                                  double axis_ratio, double* ellipse, uint8_t* mask) {

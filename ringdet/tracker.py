@@ -112,8 +112,14 @@ class RingTracker:
         self._ed_meta = None
         self._gpu_matcher = None
         self._gpu_match_roi = self._gpu_match_template = None
+        self._gpu_match_response = None
+        self._gpu_peak_mask = None
+        self._gpu_reduce_ok = True
+        self._gpu_peak_routes = {}
         self.template_backend = 'cpu'
         self.template_backend_error = ''
+        self.template_peak_backend = 'cpu'
+        self.template_peak_error = ''
         if self.P.track.template_backend not in ('auto', 'cpu', 'cuda'):
             raise ValueError('track.template_backend 必须是 auto、cpu 或 cuda')
         self.reset()
@@ -155,6 +161,9 @@ class RingTracker:
         self._appearance_result = None
         self._match_cache = OrderedDict()
         self._match_cache_bytes = 0
+        self._gpu_templates = OrderedDict()
+        self._gpu_template_bytes = 0
+        self._gpu_disks = OrderedDict()
         self.motion.reset()
 
     def close(self):
@@ -165,6 +174,9 @@ class RingTracker:
             self._ed_pool = None
         self._ed_future = None
         self._ed_meta = None
+        self._gpu_templates.clear()
+        self._gpu_template_bytes = 0
+        self._gpu_disks.clear()
 
     def warmup(self):
         S = self.P.search
@@ -181,8 +193,43 @@ class RingTracker:
             self.motion._flow(image, image, points)
             self.motion.reset()
         if self.motion.backend == 'cuda' or self.P.track.template_backend == 'cuda':
-            image = (np.arange(180 * 320).reshape(180, 320) % 251).astype(np.uint8)
-            self._match_templates(image, [image[20:37, 30:47].copy()] * 3)
+            image = np.random.default_rng(0).integers(0, 256, (180, 320), dtype=np.uint8)
+            self._match_templates(image, [image[20:37, 30:47].copy()] * 3, peak_radius=3)
+            if self.template_backend == 'cuda' and self.P.track.compact_gpu_matching and self._gpu_reduce_ok:
+                generator = np.random.default_rng(1)
+                for bucket, shape in enumerate(((160, 192), (256, 320), (448, 512))):
+                    image = generator.integers(0, 256, shape, dtype=np.uint8)
+                    template = image[20:45, 30:55].copy()
+                    image[-55:-30, -65:-40] = np.clip(template.astype(np.int16)
+                        + generator.integers(-20, 21, template.shape), 0, 255).astype(np.uint8)
+                    self._match_templates(image, [template])
+                    if self.template_backend != 'cuda':
+                        break
+                    scores = self._gpu_match_response
+                    try:
+                        reference = self._match_peaks(scores.download(), 3)
+                        compact = self._match_peaks(scores, 3, gpu=True)
+                        equivalent = (compact is not None and np.allclose(compact[:2], reference[:2], atol=1e-5)
+                                      and len(compact[2]) == len(reference[2])
+                                      and all(a[1] == b[1] and abs(a[0] - b[0]) <= 1e-5
+                                              for a, b in zip(compact[2], reference[2])))
+                        gpu_times, cpu_times = [], []
+                        for _ in range(3) if equivalent else ():
+                            started = time.perf_counter()
+                            self._match_peaks(scores, 3, gpu=True)
+                            gpu_times.append(time.perf_counter() - started)
+                            started = time.perf_counter()
+                            self._match_peaks(scores.download(), 3)
+                            cpu_times.append(time.perf_counter() - started)
+                        self._gpu_peak_routes[bucket] = bool(equivalent
+                            and np.median(gpu_times) < .95 * np.median(cpu_times))
+                    except (cv2.error, AttributeError, TypeError, RuntimeError) as error:
+                        self._gpu_reduce_ok = False
+                        self.template_peak_error = str(error)
+                        self._gpu_peak_routes[bucket] = False
+                        break
+                if self._gpu_peak_routes:
+                    self.template_peak_backend = 'auto'
 
     def _poll_ed(self, stamp):
         if self._ed_future is None or not self._ed_future.done():
@@ -278,6 +325,8 @@ class RingTracker:
         self.dbg['noise'] = fr.last_noise
         self.dbg['motion_backend'] = self.motion.backend
         self.dbg['template_backend'] = self.template_backend
+        self.dbg['template_peak_backend'] = self.template_peak_backend
+        self.dbg['template_peak_error'] = self.template_peak_error
         self.dbg['online_active'] = self.P.track.online_learning and self.online is not None
         self.dbg['online_updates'] = 0 if self.online is None else self.online['updates']
         self.dbg['online_enabled'] = self.P.track.online_learning
@@ -374,6 +423,9 @@ class RingTracker:
         self._appearance_result = None
         self._match_cache.clear()
         self._match_cache_bytes = 0
+        self._gpu_templates.clear()
+        self._gpu_template_bytes = 0
+        self._gpu_disks.clear()
         self.cursor = 0
         self.focus_cursor = 0
         self.ed_cursor = 0
@@ -627,13 +679,74 @@ class RingTracker:
         self._identity_cache[key] = score
         return score
 
-    def _match_templates(self, roi, templates):
+    def _match_peaks(self, scores, radius, gpu=False):
+        if gpu:
+            functions = ('sum', 'sqrSum', 'minMaxLoc', 'inRange', 'bitwise_not', 'bitwise_and', 'countNonZero')
+            if (not self._gpu_reduce_ok or self.P.track.template_score <= 0
+                    or not all(hasattr(cv2.cuda, name) for name in functions)):
+                return None
+            limit = float(np.finfo(np.float32).max)
+            valid = cv2.cuda.inRange(scores, (-limit,), (limit,))
+            scores.setTo(0, cv2.cuda.bitwise_not(valid))
+            w, h = scores.size()
+            mean = float(cv2.cuda.sum(scores)[0]) / (h * w)
+            variance = float(cv2.cuda.sqrSum(scores)[0]) / (h * w) - mean * mean
+            deviation = math.sqrt(max(variance, 0.0))
+            # 高均值低方差的响应图保留 CPU 统计，避免平方差消减。
+            if (not math.isfinite(mean + deviation) or deviation < 1e-5
+                    or variance <= 1e-4 * mean * mean):
+                return None
+        else:
+            mean, deviation = cv2.meanStdDev(scores)
+            mean, deviation = float(mean[0, 0]), float(deviation[0, 0])
+        peaks, mask = [], None
+        for _ in range(2):
+            if gpu:
+                _, score, _, point = cv2.cuda.minMaxLoc(scores, mask=mask) if mask is not None else cv2.cuda.minMaxLoc(scores)
+            else:
+                _, score, _, point = cv2.minMaxLoc(scores)
+            if score < self.P.track.template_score:
+                break
+            if gpu:
+                equal = cv2.cuda.inRange(scores, (score,), (score,))
+                if mask is not None:
+                    equal = cv2.cuda.bitwise_and(equal, mask)
+                # 同分峰仍由原响应图决定行优先顺序。
+                if cv2.cuda.countNonZero(equal) != 1 or abs((score - mean) / deviation - self.P.track.appearance_psr) < 1e-3:
+                    return None
+            peaks.append((score, point))
+            if gpu and len(peaks) == 1:
+                if self._gpu_peak_mask is None:
+                    self._gpu_peak_mask = cv2.cuda_GpuMat()
+                mask = self._gpu_peak_mask
+                mask.create(h, w, cv2.CV_8UC1)
+                mask.setTo(255)
+                disk = self._gpu_disks.get(radius)
+                if disk is None:
+                    circle = np.zeros((2 * radius + 1, 2 * radius + 1), np.uint8)
+                    cv2.circle(circle, (radius, radius), radius, 255, -1)
+                    disk = cv2.cuda_GpuMat()
+                    disk.upload(circle)
+                    while len(self._gpu_disks) >= 16:
+                        self._gpu_disks.popitem(last=False)
+                    self._gpu_disks[radius] = disk
+                x, y = point
+                xa, ya, xb, yb = max(0, x - radius), max(0, y - radius), min(w, x + radius + 1), min(h, y + radius + 1)
+                dx, dy = xa - x + radius, ya - y + radius
+                mask.rowRange(ya, yb).colRange(xa, xb).setTo(0,
+                    disk.rowRange(dy, dy + yb - ya).colRange(dx, dx + xb - xa))
+            elif not gpu:
+                cv2.circle(scores, point, radius, -1, -1)
+        return mean, deviation, peaks
+
+    def _match_templates(self, roi, templates, peak_radius=None):
         """共享图像频谱和积分图，计算各模板的归一化互相关。"""
         if not templates:
             return []
         h, w = roi.shape
         backend = self.P.track.template_backend
         self.template_backend = 'cpu'
+        self.template_peak_backend = 'cpu'
         if (backend != 'cpu' and self._gpu_matcher is not False and roi.dtype == np.uint8
                 and min(h, w) >= 128 and (backend == 'cuda' or self.motion.backend == 'cuda')):
             try:
@@ -643,17 +756,54 @@ class RingTracker:
                         raise RuntimeError('OpenCV 未提供可用的 CUDA 模板匹配')
                     self._gpu_matcher = factory(cv2.CV_8UC1, cv2.TM_CCOEFF_NORMED)
                     self._gpu_match_roi, self._gpu_match_template = cv2.cuda_GpuMat(), cv2.cuda_GpuMat()
+                    self._gpu_match_response = cv2.cuda_GpuMat()
                 self._gpu_match_roi.upload(np.ascontiguousarray(roi))
-                maps = []
+                maps, compact_count = [], 0
                 for template in templates:
                     if np.ptp(template) == 0:
-                        maps.append(np.ones((h - template.shape[0] + 1, w - template.shape[1] + 1), np.float32))
+                        scores = np.ones((h - template.shape[0] + 1, w - template.shape[1] + 1), np.float32)
+                        maps.append(scores if peak_radius is None else self._match_peaks(scores, peak_radius))
                         continue
-                    self._gpu_match_template.upload(np.ascontiguousarray(template))
-                    scores = self._gpu_matcher.match(self._gpu_match_roi, self._gpu_match_template).download()
+                    key = (template.shape, template.dtype.str, template.tobytes())
+                    cached = self._gpu_templates.get(key)
+                    if cached is None:
+                        capacity = min(16, max(0, self.P.search.fft_cache_mb / 2)) * 1024 ** 2
+                        if template.nbytes <= capacity:
+                            while self._gpu_templates and (len(self._gpu_templates) >= 32
+                                    or self._gpu_template_bytes + template.nbytes > capacity):
+                                _, (old_size, _) = self._gpu_templates.popitem(last=False)
+                                self._gpu_template_bytes -= old_size
+                            device_template = cv2.cuda_GpuMat()
+                            device_template.upload(np.ascontiguousarray(template))
+                            self._gpu_templates[key] = (template.nbytes, device_template)
+                            self._gpu_template_bytes += template.nbytes
+                        else:
+                            device_template = self._gpu_match_template
+                            device_template.upload(np.ascontiguousarray(template))
+                    else:
+                        _, device_template = cached
+                        self._gpu_templates.move_to_end(key)
+                    device_scores = self._gpu_matcher.match(self._gpu_match_roi, device_template, self._gpu_match_response)
+                    response_size = (h - template.shape[0] + 1) * (w - template.shape[1] + 1)
+                    bucket = int(response_size > 32768) + int(response_size > 131072)
+                    if (peak_radius is not None and self.P.track.compact_gpu_matching
+                            and self._gpu_peak_routes.get(bucket, True)):
+                        try:
+                            summary = self._match_peaks(device_scores, peak_radius, gpu=True)
+                        except (cv2.error, AttributeError, TypeError, RuntimeError) as error:
+                            self._gpu_reduce_ok = False
+                            self.template_peak_error = str(error)
+                            summary = None
+                        if summary is not None:
+                            maps.append(summary)
+                            compact_count += 1
+                            continue
+                    scores = device_scores.download()
                     np.nan_to_num(scores, copy=False, nan=0, posinf=0, neginf=0)
-                    maps.append(scores)
+                    maps.append(scores if peak_radius is None else self._match_peaks(scores, peak_radius))
                 self.template_backend = 'cuda'
+                self.template_peak_backend = ('cuda' if compact_count == len(templates)
+                                              else 'mixed' if compact_count else 'cpu')
                 return maps
             except (cv2.error, AttributeError, RuntimeError) as e:
                 self.template_backend_error = str(e)
@@ -704,7 +854,7 @@ class RingTracker:
             np.divide(cross, den, out=scores, where=den > 1e-6)
             np.clip(scores, -1, 1, out=scores)
             maps.append(scores)
-        return maps
+        return maps if peak_radius is None else [self._match_peaks(scores, peak_radius) for scores in maps]
 
     def _recovery_identity(self, fr, m):
         if not self.references:
@@ -864,20 +1014,15 @@ class RingTracker:
                 patch = cv2.resize(template, (n, n), interpolation=cv2.INTER_LINEAR)
                 patches.append(patch)
                 sizes.append((n, ratio, memory is self.keyframe))
-        score_maps = self._match_templates(roi, patches)
-        for scores, (n, ratio, clear) in zip(score_maps, sizes):
-            mean, deviation = cv2.meanStdDev(scores)
-            for _ in range(2):
-                _, score, _, point = cv2.minMaxLoc(scores)
-                if score < TP.template_score:
-                    break
+        summaries = self._match_templates(roi, patches, peak_radius=max(3, int(round(r * scale))))
+        for (mean, deviation, matches), (n, ratio, clear) in zip(summaries, sizes):
+            for score, point in matches:
                 x = x0 + (point[0] + n / 2) / scale - 0.5
                 y = y0 + (point[1] + n / 2) / scale - 0.5
                 peaks.append((score, x, y, r * ratio))
                 if clear:
-                    psr = (score - float(mean[0, 0])) / max(float(deviation[0, 0]), 1e-6)
+                    psr = (score - mean) / max(deviation, 1e-6)
                     appearance.append((score, x, y, psr))
-                cv2.circle(scores, point, max(3, int(round(r * scale))), -1, -1)
         self._template_result = self._recovery_from_peaks(fr, peaks, r)
         if self._template_result is None and not self.ambiguous and online_peaks:
             if online_candidate is None:

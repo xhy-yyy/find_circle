@@ -13,7 +13,7 @@ from typing import Optional, Tuple
 import numpy as np
 import cv2
 
-from .edcircles import ellipse_hypotheses
+from .edcircles import ellipse_hypotheses, huber_circle, ray_scores
 
 
 @dataclass
@@ -83,12 +83,15 @@ def _ray_scores(gray, cx, cy, r, delta, n_rays, V, r_ray=None):
     ys = (cy + st[:, None] * dist).astype(np.float32)
     inside = ((xs >= 0) & (xs <= W - 1) & (ys >= 0) & (ys <= H - 1)).all(axis=1)
     prof = cv2.remap(gray, xs, ys, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-    cs = np.zeros((n_rays, len(s) + 1), np.float64)
-    np.cumsum(prof, axis=1, out=cs[:, 1:])
     iw = np.nonzero((s >= -delta) & (s <= delta))[0]
     n = len(s)
-    scores = []
-    for w in widths:
+    scores = ray_scores(prof, iw, widths, step, V.gap, V.side_ratio) if V.backend != 'python' else None
+    cs = None
+    if scores is None:
+        cs = np.zeros((n_rays, len(s) + 1), np.float64)
+        np.cumsum(prof, axis=1, out=cs[:, 1:])
+        scores = []
+    for w in widths if cs is not None else ():
         nb = 2 * int(math.floor(w / (2 * step))) + 1           # 奇数，框中心落在采样点上
         ng = int(math.floor(V.gap / step + 0.5))
         nl = max(2, int(math.floor(_bg_len(w) / step + 0.5)))
@@ -125,8 +128,11 @@ def _circle3(p):
     return c, rr
 
 
-def _huber_circle(pts, c, r, delta, iters=10):
+def _huber_circle(pts, c, r, delta, iters=10, native=True):
     """几何距离 + Huber 权的 Gauss-Newton。"""
+    fitted = huber_circle(pts, c, r, delta, iters) if native else None
+    if fitted is not None:
+        return fitted
     c = np.array(c, np.float64)
     for _ in range(iters):
         d = pts - c
@@ -148,7 +154,7 @@ def _huber_circle(pts, c, r, delta, iters=10):
     return c, float(r)
 
 
-def _fit_circle(pts, tau, iters, rng, r_lim):
+def _fit_circle(pts, tau, iters, rng, r_lim, native=True):
     """RANSAC 粗筛 + Huber 精修。r_lim=(lo, hi) 之外的假设不考虑。
     返回 (center, r, inlier_mask) 或 None。"""
     n = len(pts)
@@ -166,7 +172,7 @@ def _fit_circle(pts, tau, iters, rng, r_lim):
     inl = res[b] <= tau
     if inl.sum() < 5:
         return None
-    cen, r = _huber_circle(pts[inl], c[b], rr[b], tau / 2)
+    cen, r = _huber_circle(pts[inl], c[b], rr[b], tau / 2, native=native)
     for _ in range(2):
         if not (r_lim[0] <= r <= r_lim[1]) or not np.all(np.isfinite(cen)):
             return None
@@ -174,7 +180,7 @@ def _fit_circle(pts, tau, iters, rng, r_lim):
         inl = res <= tau
         if inl.sum() < 5:
             return None
-        cen, r = _huber_circle(pts[inl], cen, r, tau / 2)
+        cen, r = _huber_circle(pts[inl], cen, r, tau / 2, native=native)
     if not (r_lim[0] <= r <= r_lim[1]) or not np.all(np.isfinite(cen)):
         return None
     res = np.abs(np.hypot(pts[:, 0] - cen[0], pts[:, 1] - cen[1]) - r)
@@ -270,7 +276,7 @@ def _one_pass(gray, cam, cx, cy, r, delta, noise, V, rng):
     # 内点容差随半径而不是线宽：手画石灰环的不圆度与半径成比例；
     # 容差必须远小于找峰窗口，否则纹理里随机的峰也能凑出高内点率
     tau = max(V.inlier_tol[0], V.inlier_tol[1] * r)
-    fit = _fit_circle(pu, tau, V.ransac_iters, rng, (0.5 * r, 1.5 * r))
+    fit = _fit_circle(pu, tau, V.ransac_iters, rng, (0.5 * r, 1.5 * r), native=V.backend != 'python')
     if fit is None:
         m.reason = 'no_fit'
         return m, None
@@ -280,6 +286,16 @@ def _one_pass(gray, cam, cx, cy, r, delta, noise, V, rng):
     m.r = float(ru)
     _finish(m, pu, px, pk, inl, cen_u, n_rays, V, cam)
     return m, cen_u
+
+
+@lru_cache(maxsize=128)
+def _ellipse_samples(n, state, increment, has_uint32, uinteger):
+    generator = np.random.Generator(np.random.PCG64())
+    generator.bit_generator.state = dict(bit_generator='PCG64', state=dict(state=state, inc=increment),
+                                        has_uint32=has_uint32, uinteger=uinteger)
+    samples = np.array([generator.choice(n, 5, replace=False) for _ in range(60)], np.int32)
+    samples.setflags(write=False)
+    return samples, generator.bit_generator.state
 
 
 def _ellipse_pass(gray, cam, m0, noise, V, rng):
@@ -305,7 +321,13 @@ def _ellipse_pass(gray, cam, m0, noise, V, rng):
         tau = max(V.inlier_tol[0], V.inlier_tol[1] * m0.r)
         best_inl, best_e = None, None
         n = len(pu)
-        samples = np.array([rng.choice(n, 5, replace=False) for _ in range(60)], np.int32)
+        if V.backend != 'python' and type(rng.bit_generator) is np.random.PCG64:
+            state = rng.bit_generator.state
+            samples, end_state = _ellipse_samples(n, state['state']['state'], state['state']['inc'],
+                                                  state['has_uint32'], state['uinteger'])
+            rng.bit_generator.state = end_state
+        else:
+            samples = np.array([rng.choice(n, 5, replace=False) for _ in range(60)], np.int32)
         native = ellipse_hypotheses(pu, samples, m0.r, tau, V.ellipse_min_axis_ratio)
         if native is not None:
             best_e, best_inl = native
@@ -349,6 +371,8 @@ def measure(gray, cam, cx, cy, r, noise, V, mode='lock', delta=None, seed=0):
     mode='lock'：首锁门槛，(cx, cy, r) 是搜索候选；
     mode='track'：跟踪门槛，(cx, cy, r) 是预测值。
     """
+    if V.backend not in ('auto', 'python'):
+        raise ValueError('verify.backend 必须是 auto 或 python')
     if delta is None:
         delta = _delta(V.delta_search if mode == 'lock' else V.delta_track, r)
     rng = np.random.default_rng(seed)

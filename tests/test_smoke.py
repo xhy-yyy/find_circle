@@ -931,6 +931,200 @@ def test_native_ellipse_preserves_measurement(monkeypatch):
     assert accelerated.sectors == reference.sectors
 
 
+@pytest.mark.parametrize('radius', [6., 24., 150.])
+def test_native_ray_scores_preserve_subpixel_profiles(radius):
+    from ringdet import verify
+    rng = np.random.default_rng(91)
+    image = rng.uniform(0, 255, (480, 720)).astype(np.float32)[:, ::-1]
+    params = Params().verify
+    assert hasattr(edcircles._load(), 'edc_ray_scores'), '先运行 ./build.sh'
+    accelerated = verify._ray_scores(image, 352.3, 237.8, radius, max(3., .15 * radius), 64, params)
+    params.backend = 'python'
+    reference = verify._ray_scores(image, 352.3, 237.8, radius, max(3., .15 * radius), 64, params)
+    for first, second in zip(accelerated['scores'], reference['scores']):
+        np.testing.assert_array_equal(first, second)
+
+
+def test_native_circle_refinement_preserves_robust_fit(monkeypatch):
+    from ringdet import verify
+    rng = np.random.default_rng(92)
+    angles = np.linspace(0, 2 * np.pi, 128, endpoint=False)
+    points = np.column_stack((132 + 45 * np.cos(angles), 87 + 45 * np.sin(angles)))
+    points += rng.normal(0, .5, points.shape)
+    points[::9] += rng.normal(0, 6, points[::9].shape)
+    assert edcircles.huber_circle(points, (130., 89.), 43., 1., 10) is not None, '先运行 ./build.sh'
+    accelerated = verify._huber_circle(points, (130., 89.), 43., 1.)
+    reference = verify._huber_circle(points, (130., 89.), 43., 1., native=False)
+    np.testing.assert_allclose(accelerated[0], reference[0], atol=1e-9)
+    assert accelerated[1] == pytest.approx(reference[1], abs=1e-9)
+    monkeypatch.setattr(verify, 'huber_circle', lambda *_: None)
+    fallback = verify._huber_circle(points, (130., 89.), 43., 1.)
+    np.testing.assert_array_equal(fallback[0], reference[0])
+    assert fallback[1] == reference[1]
+
+
+@pytest.mark.parametrize('ellipse', [False, True])
+def test_native_verification_preserves_decision_and_center(ellipse):
+    from ringdet import verify
+    rng = np.random.default_rng(97)
+    image = synth.ground_texture(240, 360, rng, amp=8)
+    radius = 30 if ellipse else 7
+    synth.draw_ring(image, 180, 120, radius, 1.5, 85,
+                    axes=(36, 24) if ellipse else None, angle_deg=28)
+    image = synth.degrade(image, rng, blur=.5, noise=1).astype(np.float32)
+    params = Params().verify
+    accelerated = verify.measure(image, Camera.default(360, 240), 180, 120, radius, 2, params, mode='track')
+    params.backend = 'python'
+    reference = verify.measure(image, Camera.default(360, 240), 180, 120, radius, 2, params, mode='track')
+    assert (accelerated.ok, accelerated.reason, accelerated.sectors, accelerated.max_gap,
+            accelerated.n_inliers) == (reference.ok, reference.reason, reference.sectors,
+                                       reference.max_gap, reference.n_inliers)
+    np.testing.assert_allclose((accelerated.cx, accelerated.cy, accelerated.r, accelerated.rms),
+                               (reference.cx, reference.cy, reference.r, reference.rms), atol=1e-7)
+
+
+def test_cached_ellipse_samples_preserve_rng_sequence():
+    from ringdet.verify import _ellipse_samples
+    for n in (24, 64, 128):
+        generator = np.random.default_rng(93)
+        generator.integers(0, 17)
+        state = generator.bit_generator.state
+        expected = np.array([generator.choice(n, 5, replace=False) for _ in range(60)], np.int32)
+        for _ in range(2):
+            samples, end_state = _ellipse_samples(n, state['state']['state'], state['state']['inc'],
+                                                 state['has_uint32'], state['uinteger'])
+            np.testing.assert_array_equal(samples, expected)
+            assert end_state == generator.bit_generator.state
+
+
+def test_cpu_compact_matches_preserve_original_peaks():
+    rng = np.random.default_rng(94)
+    roi = rng.integers(0, 256, (180, 240), dtype=np.uint8)
+    templates = [roi[40:65, 55:80].copy(), np.full((19, 19), 128, np.uint8)]
+    params = Params()
+    params.motion.backend = params.track.template_backend = 'cpu'
+    tracker = RingTracker(params)
+    maps = tracker._match_templates(roi, templates)
+    summaries = tracker._match_templates(roi, templates, peak_radius=8)
+    for scores, (mean, deviation, peaks) in zip(maps, summaries):
+        expected_mean, expected_std = cv2.meanStdDev(scores)
+        assert mean == expected_mean[0, 0] and deviation == expected_std[0, 0]
+        expected = []
+        for _ in range(2):
+            _, value, _, point = cv2.minMaxLoc(scores)
+            if value < params.track.template_score:
+                break
+            expected.append((value, point))
+            cv2.circle(scores, point, 8, -1, -1)
+        assert peaks == expected
+
+
+@pytest.mark.parametrize('case', ['normal', 'tie', 'unsupported', 'nonfinite', 'low_variance'])
+def test_gpu_compact_matching_preserves_peaks_and_fallback(monkeypatch, case):
+    uploads, downloads = [], []
+
+    class Device:
+        def __init__(self, array=None):
+            self.array, self.response = array, False
+
+        def upload(self, array):
+            uploads.append(array.shape)
+            self.array = array.copy()
+
+        def download(self):
+            downloads.append(self.response)
+            return self.array.copy()
+
+        def size(self):
+            return self.array.shape[1], self.array.shape[0]
+
+        def create(self, rows, cols, _type):
+            self.array = np.empty((rows, cols), np.uint8)
+
+        def setTo(self, value, mask=None):
+            if mask is None:
+                self.array.fill(value)
+            else:
+                self.array[mask.array != 0] = value
+
+        def rowRange(self, first, last):
+            return Device(self.array[first:last])
+
+        def colRange(self, first, last):
+            return Device(self.array[:, first:last])
+
+    class Matcher:
+        def match(self, image, template, result):
+            result.array = cv2.matchTemplate(image.array, template.array, cv2.TM_CCOEFF_NORMED)
+            result.response = True
+            if case == 'nonfinite':
+                result.array[0, :3] = (np.nan, np.inf, -np.inf)
+            if case == 'tie':
+                result.array[40, 55] = result.array[110, 170] = .999
+            if case == 'low_variance':
+                result.array = .9 + .001 * result.array
+            return result
+
+    def in_range(src, lo, hi):
+        return Device(np.where((src.array >= lo[0]) & (src.array <= hi[0]), 255, 0).astype(np.uint8))
+
+    def total(src):
+        if case == 'unsupported':
+            raise cv2.error('unsupported reduction')
+        return (float(np.sum(src.array, dtype=np.float64)), 0, 0, 0)
+
+    monkeypatch.setattr(cv2, 'cuda_GpuMat', Device)
+    operations = dict(getCudaEnabledDeviceCount=lambda: 1, createTemplateMatching=lambda *_: Matcher(),
+        sum=total, sqrSum=lambda src: (float(np.sum(src.array.astype(np.float64) ** 2)), 0, 0, 0),
+        minMaxLoc=lambda src, mask=None: cv2.minMaxLoc(src.array, mask=None if mask is None else mask.array),
+        inRange=in_range, bitwise_not=lambda src: Device(cv2.bitwise_not(src.array)),
+        bitwise_and=lambda a, b: Device(cv2.bitwise_and(a.array, b.array)),
+        countNonZero=lambda src: cv2.countNonZero(src.array))
+    for name, operation in operations.items():
+        monkeypatch.setattr(cv2.cuda, name, operation, raising=False)
+    rng = np.random.default_rng(95)
+    roi = rng.integers(0, 256, (180, 240), dtype=np.uint8)
+    template = roi[40:65, 55:80].copy()
+    copied = template.astype(np.int16)
+    if case != 'tie':
+        copied += rng.integers(-25, 26, copied.shape)
+    roi[110:135, 170:195] = np.clip(copied, 0, 255).astype(np.uint8)
+    params = Params()
+    params.motion.backend = 'cpu'
+    params.track.template_backend = 'cuda'
+    tracker = RingTracker(params)
+    expected = cv2.matchTemplate(roi, template, cv2.TM_CCOEFF_NORMED)
+    if case == 'nonfinite':
+        expected[0, :3] = 0
+    if case == 'tie':
+        expected[40, 55] = expected[110, 170] = .999
+    if case == 'low_variance':
+        expected = .9 + .001 * expected
+    mean, deviation = cv2.meanStdDev(expected)
+    expected_peaks = []
+    for _ in range(2):
+        _, value, _, point = cv2.minMaxLoc(expected)
+        expected_peaks.append((value, point))
+        cv2.circle(expected, point, 8, -1, -1)
+    for _ in range(2):
+        summaries = tracker._match_templates(roi, [template, template.copy()], peak_radius=8)
+        assert tracker.template_backend == 'cuda'
+        for actual_mean, actual_std, peaks in summaries:
+            assert actual_mean == pytest.approx(mean[0, 0], abs=1e-8)
+            assert actual_std == pytest.approx(deviation[0, 0], abs=1e-8)
+            assert peaks == expected_peaks
+    assert uploads.count(template.shape) == 1
+    assert sum(downloads) == (4 if case in ('tie', 'unsupported', 'low_variance') else 0)
+    if case == 'normal':
+        tracker.warmup()
+        assert set(tracker._gpu_peak_routes) == {0, 1, 2}
+    tracker._gpu_peak_routes = {0: False, 1: False, 2: False}
+    summary = tracker._match_templates(roi, [template], peak_radius=8)[0]
+    assert summary[2] == expected_peaks
+    assert tracker.template_peak_backend == 'cpu'
+    tracker.close()
+
+
 def test_cuda_auto_falls_back_without_device(monkeypatch):
     from ringdet.motion import GroundMotion
     monkeypatch.setattr(cv2.cuda, 'getCudaEnabledDeviceCount', lambda: 0)
@@ -972,6 +1166,28 @@ def test_cuda_ncc_matches_cpu():
     scores = tracker._match_templates(roi, [template])[0]
     assert tracker.template_backend == 'cuda'
     np.testing.assert_allclose(scores, cv2.matchTemplate(roi, template, cv2.TM_CCOEFF_NORMED), atol=1e-3)
+
+
+@pytest.mark.skipif(cv2.cuda.getCudaEnabledDeviceCount() == 0 or not hasattr(cv2.cuda, 'createTemplateMatching'),
+    reason='需要 CUDA 设备和 OpenCV CUDA 模板匹配模块')
+def test_cuda_compact_peaks_preserve_downloaded_response():
+    rng = np.random.default_rng(96)
+    roi = rng.integers(0, 256, (180, 240), dtype=np.uint8)
+    template = roi[40:65, 55:80].copy()
+    params = Params()
+    params.motion.backend = 'cpu'
+    params.track.template_backend = 'cuda'
+    tracker = RingTracker(params)
+    tracker.warmup()
+    response = tracker._match_templates(roi, [template])[0]
+    expected_mean, expected_std = cv2.meanStdDev(response)
+    _, expected_score, _, expected_point = cv2.minMaxLoc(response)
+    mean, deviation, peaks = tracker._match_templates(roi, [template], peak_radius=8)[0]
+    assert mean == pytest.approx(expected_mean[0, 0], abs=1e-5)
+    assert deviation == pytest.approx(expected_std[0, 0], abs=1e-5)
+    assert peaks[0][1] == expected_point
+    assert peaks[0][0] == pytest.approx(expected_score, abs=1e-5)
+    tracker.close()
 
 
 def test_record_queue_does_not_block_vision(monkeypatch):

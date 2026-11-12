@@ -48,6 +48,15 @@ def _load():
                 lib.edc_ellipse_hypotheses.restype = ctypes.c_int
                 lib.edc_ellipse_hypotheses.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
                     ctypes.c_int, ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_void_p, ctypes.c_void_p]
+            if hasattr(lib, 'edc_huber_circle'):
+                lib.edc_huber_circle.restype = ctypes.c_int
+                lib.edc_huber_circle.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
+                                               ctypes.c_double, ctypes.c_int]
+            if hasattr(lib, 'edc_ray_scores'):
+                lib.edc_ray_scores.restype = ctypes.c_int
+                lib.edc_ray_scores.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                    ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_int,
+                    ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_void_p]
             _lib = lib
             _lib_err = None
             return _lib
@@ -100,6 +109,29 @@ def ellipse_hypotheses(points, samples, radius, tolerance, axis_ratio):
     if rc < 0:
         return None
     return ellipse, mask.astype(bool)
+
+
+def huber_circle(points, center, radius, delta, iterations):
+    lib = _load()
+    if lib is None or not hasattr(lib, 'edc_huber_circle'):
+        return None
+    points = np.ascontiguousarray(points, np.float64)
+    circle = np.array([center[0], center[1], radius], np.float64)
+    rc = lib.edc_huber_circle(points.ctypes.data, len(points), circle.ctypes.data, delta, iterations)
+    return None if rc else (circle[:2], float(circle[2]))
+
+
+def ray_scores(profiles, positions, widths, step, gap, side_ratio):
+    lib = _load()
+    if lib is None or not hasattr(lib, 'edc_ray_scores'):
+        return None
+    profiles = np.ascontiguousarray(profiles, np.float64)
+    positions = np.ascontiguousarray(positions, np.int32)
+    widths = np.ascontiguousarray(widths, np.float64)
+    scores = np.empty((len(widths), profiles.shape[0], len(positions)), np.float64)
+    rc = lib.edc_ray_scores(profiles.ctypes.data, *profiles.shape, positions.ctypes.data,
+        len(positions), widths.ctypes.data, len(widths), step, gap, side_ratio, scores.ctypes.data)
+    return None if rc else list(scores)
 
 
 def _detect_edlib(gray, grad, anchor, sigma, min_path, op, scan, validate):
