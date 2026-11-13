@@ -34,6 +34,7 @@ class GroundMotion:
         self.error = 0.0
         self.points = None
         self.n_global = 0
+        self._corner_capacity = 0     # 上次实际检出的角点数（低纹理场景会明显少于 max_corners）
         self.frames = 0
         self.backend = 'cpu'
         self.backend_error = ''
@@ -70,6 +71,7 @@ class GroundMotion:
         self.error = 0.0
         self.points = None
         self.n_global = 0
+        self._corner_capacity = 0
         self.frames = 0
         if self._gpu_prev is not None:
             self._gpu_prev.release()
@@ -149,10 +151,16 @@ class GroundMotion:
                 self._gpu_prev.release()
             return None
         pts, n_global = self.points, self.n_global
-        refresh = self.frames % max(1, P.refresh_frames) == 0
-        if pts is None or n_global < max(P.min_inliers, int(P.refresh_ratio * P.max_corners)) or refresh:
+        # 按"上次实际检出数"的比例判断存活：低纹理画面一帧只能检出 ~100 个角点，
+        # 用 max_corners 的绝对比例（0.6*300=180）会永远满足重检条件，变成每帧都重检。
+        need = max(10, int(P.refresh_ratio * self._corner_capacity))
+        # 检出少说明纹理弱、角点掉得快，定期重检的间隔也按比例缩短，避免跟踪点老死。
+        period = max(2, int(round(P.refresh_frames * self._corner_capacity / max(1, P.max_corners))))
+        refresh = self.frames % max(1, period) == 0
+        if pts is None or n_global < need or refresh:
             pts = self._corners(prev, P.max_corners, P.min_distance)
             n_global = 0 if pts is None else len(pts)
+            self._corner_capacity = n_global
         if pts is None:
             if self._gpu_prev is not None:
                 self._gpu_prev.release()

@@ -73,7 +73,9 @@ def _ray_scores(gray, cx, cy, r, delta, n_rays, V, r_ray=None, widths=None):
     """
     H, W = gray.shape
     widths = _widths(r, V.width_ratio) if widths is None else [float(w) for w in widths]
-    step = V.step
+    # 采样步长随找峰窗口放大：每条射线在窗口内保持约 80 个采样点。
+    # 固定 0.5px 时 r=190、delta=57 一条射线要采 300+ 点，大环复核耗时随 r 线性增长。
+    step = max(V.step, float(delta) / 40.0)
     th, ct, st = _angles(n_rays)
     rr = np.full(n_rays, float(r)) if r_ray is None else np.asarray(r_ray, np.float64)
     ext = max(w / 2 + V.gap + _bg_len(w) for w in widths) + 2 * step
@@ -112,7 +114,7 @@ def _ray_scores(gray, cx, cy, r, delta, n_rays, V, r_ray=None, widths=None):
         sc[np.abs(a - b) > V.side_ratio * np.maximum(sc, 0)] = 0.0
         scores.append(sc)
     return dict(thetas=th, ct=ct, st=st, s=s, iw=iw, inside=inside, scores=scores, widths=widths,
-                r_ray=rr, meds=meds)
+                r_ray=rr, meds=meds, step=step)
 
 
 def _circle3(p):
@@ -259,9 +261,10 @@ def _peaks(gray, cx, cy, r, delta, noise, V, r_ray=None, widths=None):
     else:
         meds = d['meds']
     j = int(np.argmax(meds))
+    step = d['step']
     sc = d['scores'][j]
     thr = max(V.k_sigma * noise, V.min_contrast)
-    picked = peak_pick(sc, d['r_ray'], d['s'][d['iw']], V.step, thr, inside) if V.backend != 'python' else None
+    picked = peak_pick(sc, d['r_ray'], d['s'][d['iw']], step, thr, inside) if V.backend != 'python' else None
     if picked is not None:
         _, peak, dist, valid = picked
     else:
@@ -275,7 +278,7 @@ def _peaks(gray, cx, cy, r, delta, noise, V, r_ray=None, widths=None):
         with np.errstate(divide='ignore', invalid='ignore'):
             off = np.where((den < 0) & (k > 0) & (k < sc.shape[1] - 1), 0.5 * (y0 - y2) / den, 0.0)
         off = np.clip(off, -0.5, 0.5)
-        dist = d['r_ray'] + d['s'][d['iw'][k]] + off * V.step
+        dist = d['r_ray'] + d['s'][d['iw'][k]] + off * step
         valid = inside & (peak >= thr)
     m.n_valid = int(valid.sum())
     m.line_w = d['widths'][j]
@@ -412,6 +415,14 @@ def _gate_reason(m, cx, cy, r, V, mode):
         min_sec = max(V.track_sectors, V.lock_sectors - 2)
         max_gap = min(V.track_max_gap, V.lock_max_gap + 2)
         min_inliers = max(V.min_inlier_ratio, V.lock_min_inlier_ratio - .10)
+    if lock and r < 20:
+        # 半径 20 px 以下的环周长只有 40~120 px：16 个扇区每个只分到 3~8 条射线，
+        # 一条射线偏 1 px 整个扇区就作废；快速下降时有运动模糊，实测干净的环
+        # （内点率 1.0、RMS 0.23）也只有 9~12 个扇区，按 14 要求会永远锁不上。
+        # 扇区门槛随半径折减，内点率、RMS、半径/圆心一致性仍然照旧。
+        min_sec = max(V.track_sectors, int(round(V.lock_sectors * max(0.7, r / 20.0))))
+        # 缺的扇区常常是连着的（高光/模糊），小环允许空一段，最多 1/4 圈。
+        max_gap = max(max_gap, min(V.sectors // 4, V.sectors - min_sec + 1))
     if m.sectors < min_sec:
         return f'sectors {m.sectors}<{min_sec}'
     if m.max_gap > max_gap:

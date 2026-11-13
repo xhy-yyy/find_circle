@@ -26,7 +26,7 @@ class SearchParams:
     level_r_max: float = 20.0    # 层内半径超过它就去下一层金字塔
     tile: int = 512              # 分块边长（层内 px），块间重叠 = 最大核半径
     radii_per_job: int = 6       # 每个任务 = 一块 x 至多这么多个半径
-    budget_ms: float = 40.0      # 搜索候选生成与复核共用的每帧预算
+    budget_ms: float = 18.0      # 搜索候选生成与复核共用的每帧预算（Nano 上 40ms 会让画面发卡）
     verify_pending_first: bool = False  # 优先复核积压候选，预算耗尽时也允许一次复核
     min_score: float = 2.0       # S = min(M-I, M-O) / max(sigma, noise_floor)
     side_ratio: float = 3.0      # |I-O| > side_ratio*S 的位置不当候选
@@ -48,6 +48,7 @@ class SearchParams:
     ed_cell: int = 640           # 区域 ED 的分格边长（原图 px）
     # 候选级 EDCircles：复核通过的候选，在它周围的小块上放大后再跑一次 EDCircles（高空细环全图跑连不成圆）
     ed_local: bool = True
+    ed_local_max_r: float = 80.0       # 只对半径不超过它的候选做本地放大 ED；大环全图 ED 已能连成圆，本地复核又慢又没用
     ed_local_target_r: float = 24.0    # 放大到半径约这么大
     ed_local_max_zoom: float = 4.0
     ed_local_margin: float = 2.2       # 小块半边长 = margin * r
@@ -62,8 +63,10 @@ class SearchParams:
     escalate_s: float = 3.0      # 框内这么久没有候选通过复核就扩大一级
     click_max_levels: int = 1    # 最多扩大几级（每级边长 x2）；0 = 只在初始框里找
     click_only: bool = True      # True：没点击就不搜索（输出 LOST）；False：没点击时全图搜索
+    click_probe: bool = True     # 点击当帧先在点击点按 1.25 半径阶梯直接复核一次（操作员点的就是环）
     fft_cache_mb: float = 96.0    # 核频谱缓存上限
     async_ed: bool = True        # 区域 ED 在单个后台线程执行，结果在当前帧重新验证
+    async_template: bool = True  # 重捕的模板匹配放后台线程；主循环先输出光流预测，不阻塞单次 30~50ms 的匹配
     async_search: bool = False  # FFT 和大范围模板匹配使用同一个后台搜索线程
     click_focus_r_max: float = 12.0  # 点击附近高频复查的小环半径上限
     click_focus_half: int = 0  # 0 = 使用 click_tile 作为局部搜索半边长
@@ -136,9 +139,11 @@ class TrackParams:
     assoc: Tuple[float, float] = (3.0, 0.25)   # 同一候选：中心差 <= max(a, b*r)
     assoc_radius: float = 0.15   # 且半径差 <= 15%
     max_cands: int = 30
-    max_verify: int = 40         # 每帧最多复核多少个新候选
+    max_verify: int = 6          # 每帧最多复核多少个新候选（一次完整复核可达 10~20ms，不能放开）
     cand_timeout_s: float = 1.0  # 候选这么久没通过就丢弃
     coast_s: float = 0.3
+    track_miss_grace: int = 2      # 跟踪态允许连续失败几帧再判丢失（期间输出预测）
+    shift_retry_r: float = 60.0    # 复核失败时在预测点周围补试的最大半径（px）；0 = 关闭
     stable_track_frames: int = 6
     stable_no_flow_s: float = 0.12
     stable_template_grace_s: float = 0.0  # 光流可靠时短暂等待几何复核恢复
@@ -151,6 +156,7 @@ class TrackParams:
     reacq_expand_s: float = 1.0  # 之后扩到全图、半径 ±50%
     reacq_giveup_s: float = 3.0  # 之后回到 SEARCH
     lock_need_edcircles: bool = True   # 首锁要求 EDCircles 至少找到过一次（EDCircles 不可用时自动不要求）
+    lock_click_bypass_ed: bool = True  # 点击直测的候选由操作员指定，不再要求 ED 支持，但仍需多帧严格复核
     prefer_ratio: float = 0.5    # 两个候选都合格时，离参考点（点击点，没有则画面中心）距离比 < 0.5 的胜出
     prefer_dist_r: float = 2.0   # 重捕时优先最后位置 2r 以内的候选
     # 下降中途丢失后回到全图搜索时，半径下限 = 最后跟踪半径 x 它（飞机只降不升，环不会变小太多）；

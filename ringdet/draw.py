@@ -45,10 +45,17 @@ def draw_result(frame, res, scale=1.0):
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
     sp = scale
     d = res.debug
-    if res.phase == 'SEARCH' and res.click_px is not None and d.get('region') is not None:
-        x0, y0, x1, y1 = d['region']
+    # 搜索/重捕范围：重捕时这个框由光流从最后一次位置搬运过来，画出来方便判断是否漂走。
+    region = d.get('region')
+    if res.phase in ('SEARCH', 'REACQUIRE') and region is not None:
+        x0, y0, x1, y1 = region
+        x0, y0 = max(0, int(x0 * sp)), max(0, int(y0 * sp))
+        x1, y1 = min(img.shape[1] - 1, int(x1 * sp) - 1), min(img.shape[0] - 1, int(y1 * sp) - 1)
         if x1 > x0 and y1 > y0:
-            cv2.rectangle(img, (int(x0 * sp), int(y0 * sp)), (int(x1 * sp) - 1, int(y1 * sp) - 1), YELLOW, 1)
+            color = ORANGE if res.phase == 'REACQUIRE' else YELLOW
+            cv2.rectangle(img, (x0, y0), (x1, y1), color, 1)
+            cv2.putText(img, 'REACQ' if res.phase == 'REACQUIRE' else 'SEARCH', (x0 + 4, min(img.shape[0] - 4, y0 + 16)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45 * sp, color, 1, cv2.LINE_AA)
     if res.center_px is not None:
         x, y = res.center_px[0] * sp, res.center_px[1] * sp
         color = GREEN if res.state == 'DETECTED' else ORANGE

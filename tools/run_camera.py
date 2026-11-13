@@ -197,8 +197,11 @@ def open_camera(dev, W, H, fps, capture='auto', pixel_format='MJPG'):
     plugin = Path('/usr/lib/aarch64-linux-gnu/gstreamer-1.0/libgstnvvideo4linux2.so')
     if capture == 'auto' and pixel_format == 'MJPG' and plugin.is_file():
         device = str(dev).replace('\\', '\\\\').replace('"', '\\"')
+        # framerate 必须是整数分式：argparse 传进来的是 float，写成 60.0/1 会被 GStreamer
+        # 当成非法 caps，整条管道起不来（报 Internal data stream error），然后静默回退软件解码。
+        fps_i = max(1, int(round(fps)))
         pipeline = (f'v4l2src device="{device}" io-mode=2 ! '
-                    f'image/jpeg,width={W},height={H},framerate={fps}/1 ! '
+                    f'image/jpeg,width={W},height={H},framerate={fps_i}/1 ! '
                     'jpegparse ! nvv4l2decoder mjpeg=true ! nvvidconv ! '
                     'video/x-raw,format=BGRx ! '
                     'appsink max-buffers=1 drop=true sync=false')
@@ -305,12 +308,17 @@ def main():
         elif not a.quiet:
             print(s, flush=True)
 
+    click_rx = 0
+
     def handle(msg):
+        nonlocal click_rx
         if 'click' in msg:
             trk.set_click(*msg['click'])
+            click_rx += 1
         if 'click_norm' in msg:
             u, v = msg['click_norm']
             trk.set_click(u * rw - 0.5, v * rh - 0.5)
+            click_rx += 1
         if 'height' in msg:
             trk.set_height(msg['height'])
         if msg.get('reset'):
@@ -337,6 +345,8 @@ def main():
     last_display = 0.0
     last_backend = trk.motion.backend
     stats_start, stats_count, stats_skipped, stats_ms = time.monotonic(), 0, 0, []
+    loop_ms = []
+    last_loop = 0.0
     measured_fps = 0.0
     capture_fps = 0.0
     last_search_error = last_match_error = ''
@@ -353,6 +363,7 @@ def main():
                         print(f'[输入忽略] {e}', file=sys.stderr)
             for c in clicks:
                 trk.set_click(*c)
+            click_rx += len(clicks)
             clicks.clear()
             frame, stamp, seq = grab.get()
             now = time.monotonic()
@@ -386,6 +397,8 @@ def main():
             emit(d)
             stats_count += 1
             stats_ms.append(res.debug['ms'])
+            loop_ms.append((now - last_loop) * 1000 if last_loop else 0.0)
+            last_loop = now
             elapsed = time.monotonic() - stats_start
             if elapsed >= 1:
                 measured_fps = stats_count / elapsed
@@ -393,9 +406,15 @@ def main():
                 if a.stats:
                     ordered = sorted(stats_ms)
                     p95 = ordered[max(0, math.ceil(.95 * len(ordered)) - 1)]
+                    loop_sorted = sorted(m for m in loop_ms if m)
+                    loop_p50 = loop_sorted[len(loop_sorted) // 2] if loop_sorted else 0.0
+                    click_info = f'，点击 {click_rx} 次' if click_rx else ''
                     print(f'[性能] 采集 {capture_fps:.1f} FPS，实际处理 {measured_fps:.1f} FPS，漏处理 {stats_skipped} 帧，'
-                          f'算法 P95 {p95:.1f} ms，帧龄 {d["frame_age_ms"]:.1f} ms', file=sys.stderr)
+                          f'算法 P95 {p95:.1f} ms，循环 {loop_p50:.1f} ms，帧龄 {d["frame_age_ms"]:.1f} ms'
+                          + click_info, file=sys.stderr)
+                click_rx = 0
                 stats_start, stats_count, stats_skipped, stats_ms = time.monotonic(), 0, 0, []
+                loop_ms.clear()
             res.debug['fps'] = measured_fps
             res.debug['camera_fps'] = capture_fps
             res.debug['frame_age_ms'] = d['frame_age_ms']

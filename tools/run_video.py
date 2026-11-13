@@ -39,6 +39,7 @@ def main():
     ap.add_argument('--show', action='store_true')
     ap.add_argument('--params')
     ap.add_argument('--threads', type=int, default=4)
+    ap.add_argument('--debug', action='store_true', help='jsonl 里写入完整调试字段（rejected/identity/r_range 等）')
     ap.add_argument('--set', action='append', default=[])
     a = ap.parse_args()
     if a.threads < 1:
@@ -118,7 +119,8 @@ def main():
             if a.show:
                 vis = draw_result(frame, res, scale=disp_scale)
             if jf:
-                jf.write(json.dumps(res.to_dict(), ensure_ascii=False) + '\n')
+                jf.write(json.dumps(res.to_dict(debug=a.debug), ensure_ascii=False,
+                                    default=lambda o: o.tolist() if hasattr(o, 'tolist') else str(o)) + '\n')
             i += 1
             if a.max_frames and i >= a.max_frames:
                 break

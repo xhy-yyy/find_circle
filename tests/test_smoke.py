@@ -56,7 +56,11 @@ def test_no_click_no_search():
 def test_tracker_locks_and_follows():
     rng = np.random.default_rng(0)
     frames, gts = synth.descent(rng, n=40, size=(640, 360), r0=12, r1=30, distractors=False)
-    trk = RingTracker(Params(), Camera.default(640, 360))
+    # 这个用例量的是算法锁定时延，不该被机器快慢和每帧预算左右（慢机器上预算会截断复核）。
+    params = Params()
+    params.track.frame_budget_ms = 500
+    params.search.budget_ms = 500
+    trk = RingTracker(params, Camera.default(640, 360))
     trk.set_click(gts[0][0] + 80, gts[0][1] - 50)     # 粗点：偏 ~94 px
     states, clicks = [], []
     for i, (f, gt) in enumerate(zip(frames, gts)):
@@ -167,7 +171,9 @@ def test_keyframe_position_survives_geometry_failure_and_expires(monkeypatch):
     image = synth.ground_texture(360, 640, rng)
     synth.draw_ring(image, 320, 180, 18, 2, 75)
     image = synth.degrade(image, rng)
-    tracker = RingTracker(Params(), Camera.default(640, 360))
+    params = Params()
+    params.search.async_template = False      # 本用例按时序断言模板找回，关闭后台模板线程
+    tracker = RingTracker(params, Camera.default(640, 360))
     tracker.set_click(320, 180)
     for i in range(24):
         result = tracker.process(image, i / 30, i)
@@ -378,6 +384,84 @@ def test_stable_template_grace_keeps_geometry_checks_and_expires(monkeypatch):
         tracker.close()
 
 
+@pytest.mark.parametrize('clear_again', [True, False])
+def test_stable_local_coast_keeps_identity_until_timeout(monkeypatch, clear_again):
+    import ringdet.tracker as module
+    from ringdet.motion import Motion
+    from ringdet.verify import Measurement
+
+    params = Params()
+    params.track.local_reacq_hits = 2
+    params.track.stable_template_grace_s = .15
+    params.track.fast_measure_every = 5
+    tracker = RingTracker(params, Camera.default(320, 180))
+    tracker.tgt = [160., 90., 12.]
+    tracker.phase, tracker.last_detect, tracker.target_id = 'TRACK', 0., 1
+    if clear_again:
+        tracker._identity_score, tracker._identity_frame = .95, 0
+    else:
+        tracker.stable_track_hits = params.track.stable_track_frames
+    tracker.references = [dict(angle=0.)]
+    tracker.motion.local_ok, tracker.motion.error = True, 2.0 if clear_again else .2
+    tracker._measure_width_ratio = .1
+    transform = Motion(np.float64([[1, 0, 0], [0, 1, 0]]), 80)
+    monkeypatch.setattr(tracker.motion, 'update', lambda _: transform)
+    monkeypatch.setattr(tracker, '_remember', lambda *_: tracker.dbg.update(target_identity_score=.95))
+    calls, searches = [], []
+
+    def measure(_fr, _cam, x, y, r, *_args, quick=False, **_kwargs):
+        calls.append((tracker.n_frames, quick))
+        if clear_again and tracker.n_frames == 3:
+            return Measurement(True, '', x, y, r, sectors=16, inlier_ratio=.95, rms=.2, line_w=1.2)
+        return Measurement(False, 'few_valid')
+
+    monkeypatch.setattr(module, 'measure_channels', measure)
+    monkeypatch.setattr(tracker, '_template_measure', lambda *_: searches.append(tracker.n_frames))
+    image = np.zeros((180, 320), np.uint8)
+    try:
+        for stamp in (.03, .10):
+            res = tracker.process(image, stamp)
+            assert (res.state, res.phase, res.target_id) == ('PREDICTED', 'COAST', 1)
+            assert tracker.template_hold == 0 and tracker.reacq is None
+        assert calls == [(1, True), (1, False), (2, True)] and not searches
+        res = tracker.process(image, .13 if clear_again else .16)
+        if clear_again:
+            assert (res.state, res.phase, res.target_id) == ('DETECTED', 'TRACK', 1)
+            assert not searches
+        else:
+            assert res.phase == 'REACQUIRE' and tracker.reacq['flow_only']
+            assert not searches
+    finally:
+        tracker.close()
+
+
+@pytest.mark.parametrize('identity', [.6, .9])
+def test_recovery_of_shifted_circle_requires_identity_and_two_frames(monkeypatch, identity):
+    import ringdet.tracker as module
+    from ringdet.motion import Motion
+    from ringdet.verify import Measurement
+
+    params = Params()
+    params.track.local_reacq_hits = 2
+    params.search.use_edcircles = params.search.use_matched_filter = False
+    tracker = RingTracker(params, Camera.default(320, 180))
+    tracker.tgt, tracker.last_detect = [140., 90., 40.], 0.
+    tracker.references = [dict(angle=0.)]
+    tracker._begin_reacquire(.2)
+    transform = Motion(np.float64([[1, 0, 0], [0, 1, 0]]), 80)
+    monkeypatch.setattr(tracker.motion, 'update', lambda _: transform)
+    monkeypatch.setattr(tracker, '_reference_score', lambda *_: identity)
+    monkeypatch.setattr(module, 'measure_channels', lambda *_a, **_kw: Measurement(
+        False, 'shift 24.0', 164., 90., 40., sectors=16, inlier_ratio=.95, rms=.2, line_w=3.))
+    image = np.zeros((180, 320), np.uint8)
+    try:
+        assert tracker.process(image, .22).state == 'LOST'
+        res = tracker.process(image, .25)
+        assert res.state == ('DETECTED' if identity >= .8 else 'LOST')
+    finally:
+        tracker.close()
+
+
 def test_broken_motion_chain_requires_identity_and_expires(monkeypatch):
     from ringdet.motion import Motion
     rng = np.random.default_rng(35)
@@ -465,7 +549,9 @@ def test_foreign_circle_cannot_replace_trusted_identity(monkeypatch):
     image = background.copy()
     synth.draw_ring(image, 320, 180, 18, 2, 75)
     image = synth.degrade(image, rng)
-    tracker = RingTracker(Params(), Camera.default(640, 360))
+    params = Params()
+    params.search.async_template = False      # 本用例按时序断言模板找回，关闭后台模板线程
+    tracker = RingTracker(params, Camera.default(640, 360))
     tracker.set_click(320, 180)
     for i in range(12):
         result = tracker.process(image, i / 30, i)
@@ -657,6 +743,7 @@ def test_pending_search_verifies_before_fft_even_after_budget(monkeypatch):
 
     params = Params()
     params.search.verify_pending_first = True
+    params.search.click_probe = False       # 这个用例只验证 pending 复核顺序，不涉及点击直测
     params.search.use_edcircles = False
     params.search.ed_local = False
     tracker = RingTracker(params, Camera.default(320, 180))
@@ -804,6 +891,7 @@ def test_equal_identity_candidates_remain_ambiguous(monkeypatch):
     image = synth.degrade(image, rng)
     params = Params()
     params.track.reacq_box_min = 300
+    params.search.async_template = False      # 本用例按时序断言模板找回，关闭后台模板线程
     tracker = RingTracker(params, Camera.default(640, 360))
     tracker.set_click(320, 180)
     for i in range(12):
@@ -885,6 +973,7 @@ def test_small_ring_without_ed_requires_consecutive_strong_geometry(monkeypatch)
 
     params = Params()
     params.track.small_ring_geometry_hits = 8
+    params.track.lock_click_bypass_ed = False    # 这个用例验证"无 ED 时要求连续强几何"的策略，不启用点击直测豁免
     params.track.frame_budget_ms = 1000
     params.search.budget_ms = 1000
     tracker = RingTracker(params, Camera.default(320, 180))
@@ -938,7 +1027,9 @@ def test_protected_memory_recovers_when_working_template_is_unusable(monkeypatch
     image = synth.ground_texture(360, 640, rng)
     synth.draw_ring(image, 320, 180, 18, 2, 75)
     image = synth.degrade(image, rng)
-    tracker = RingTracker(Params(), Camera.default(640, 360))
+    params = Params()
+    params.search.async_template = False      # 本用例按时序断言模板找回，关闭后台模板线程
+    tracker = RingTracker(params, Camera.default(640, 360))
     tracker.set_click(320, 180)
     for i in range(12):
         result = tracker.process(image, i / 30, i)
@@ -1131,6 +1222,19 @@ def test_async_ed_candidates_require_valid_current_coordinates(invalidate):
     else:
         assert len(found) == 1
         np.testing.assert_allclose((found[0].x, found[0].y, found[0].r), (126, 231.2, 6.6))
+
+
+def test_click_lock_is_not_starved_by_frame_budget():
+    """1080p 慢机器上光流/预处理就能吃满整帧预算，点击阶梯和确认仍要继续。"""
+    rng = np.random.default_rng(0)
+    frames, gts = synth.descent(rng, n=8, size=(1920, 1080), r0=28, r1=34, distractors=False)
+    params = Params()
+    params.track.frame_budget_ms = 1.0     # 预算已经耗尽，模拟 Nano 上 1080p 的真实情况
+    params.search.budget_ms = 48.0
+    tracker = RingTracker(params, Camera.default(1920, 1080))
+    tracker.set_click(*gts[0][:2])
+    states = [tracker.process(f, i / 60, i).state for i, f in enumerate(frames)]
+    assert 'DETECTED' in states, states
 
 
 def test_cpu_native_flow_matches_opencv():
@@ -1391,12 +1495,12 @@ def test_nano_profile_preserves_detection_parameters():
     expected = asdict(Params())
     actual = asdict(Params.load(path))
     expected['track']['compact_gpu_matching'] = False
-    expected['track']['stable_template_grace_s'] = .075
+    expected['track']['stable_template_grace_s'] = .15
     expected['track']['identity_every'] = 4
     expected['track'].update(template_cuda_min_area=90000, recovery_local_s=.12, small_ring_geometry_hits=8,
                              local_reacq_hits=2, stagger_recovery_scales=True,
-                             fast_measure_every=5, online_update_frames=6, identity_init_hits=4,
-                             reacq_weak_hits=3, reacq_giveup_s=6.0, lost_r_floor=.3)
+                             fast_measure_every=5, online_update_frames=6, identity_init_hits=3,
+                             reacq_confirm_hits=2, reacq_weak_hits=2, reacq_giveup_s=6.0, lost_r_floor=.3)
     expected['motion'].update(width=560, max_corners=160, refresh_ratio=.4)
     expected['search'].update(budget_ms=48., radii_per_job=6, click_focus_half=240,
                               click_focus_radii_per_job=6, verify_pending_first=True, async_search=False,

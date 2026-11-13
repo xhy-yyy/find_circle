@@ -22,15 +22,16 @@ motion:
 
 track:
   identity_every: 4
-  identity_init_hits: 4
+  identity_init_hits: 3
+  reacq_confirm_hits: 2
   fast_measure_every: 5
   online_update_frames: 6
-  reacq_weak_hits: 3
+  reacq_weak_hits: 2
   reacq_giveup_s: 6.0
   lost_r_floor: 0.3
   small_ring_geometry_hits: 8
   local_reacq_hits: 2
-  stable_template_grace_s: 0.075
+  stable_template_grace_s: 0.15
   template_backend: auto
   template_cuda_min_area: 90000
   recovery_local_s: 0.12
