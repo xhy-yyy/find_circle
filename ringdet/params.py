@@ -152,7 +152,6 @@ class TrackParams:
     appearance_psr: float = 2.0
     reacq_box_r: float = 6.0     # 重捕框边长 = 6r
     reacq_box_min: float = 240.0  # 小环重捕框的最小边长（原图 px）
-    reacq_radius: float = 0.25   # 重捕半径范围 ±25%
     reacq_expand_s: float = 1.0  # 之后扩到全图、半径 ±50%
     reacq_giveup_s: float = 3.0  # 之后回到 SEARCH
     lock_need_edcircles: bool = True   # 首锁要求 EDCircles 至少找到过一次（EDCircles 不可用时自动不要求）
@@ -194,19 +193,18 @@ class Params:
     @classmethod
     def load(cls, path=None, overrides=()):
         p = cls()
+        import yaml
         if path:
             with open(path, 'r', encoding='utf-8') as f:
                 text = f.read()
             if path.endswith('.json'):
                 data = json.loads(text)
             else:
-                import yaml
                 data = yaml.safe_load(text) or {}
             p.update(data)
         for item in overrides:
             key, _, value = item.partition('=')
             sec, _, name = key.strip().partition('.')
-            import yaml
             p.update({sec: {name: yaml.safe_load(value)}})
         return p
 

@@ -21,7 +21,7 @@ import cv2
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 from ringdet import Params, Camera, synth  # noqa: E402
 from ringdet.search import RingSearcher, build_pyramid, merge_candidates, plan_ed, run_ed  # noqa: E402
-from ringdet.tracker import frame_noise  # noqa: E402
+from ringdet.frame import frame_noise  # noqa: E402
 from ringdet.verify import measure  # noqa: E402
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')

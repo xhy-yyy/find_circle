@@ -106,7 +106,6 @@ def main():
             print(f'[跳过] 读不了：{path}')
             continue
         H, W = img.shape[:2]
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         cam = Camera.from_yaml(a.calib, (W, H)) if a.calib else Camera.default(W, H, a.fx)
         if a.height:
             r0 = cam.fx * (P.ring.diameter_m / 2) / a.height

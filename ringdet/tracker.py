@@ -18,7 +18,7 @@ from .camera import Camera
 from .motion import GroundMotion
 from .params import Params
 from . import edcircles as edc
-from .frame import Frame, frame_noise, noise_sigma  # noqa: F401  frame_noise 供工具脚本导入
+from .frame import Frame, noise_sigma
 from .search import Candidate, RingSearcher, EdJob, build_pyramid, merge_candidates, plan_ed, run_ed, confirm_ed, ED_SCORE
 from .verify import Measurement, measure, _delta
 

@@ -28,9 +28,6 @@ from ringdet import Params, Camera, detect_frame, synth  # noqa: E402
 CHANNELS = ('双通道',)       # 复核时先灰度、再白度 min(B,G,R)，见 ringdet/frame.py
 
 
-def to_channel(bgr, ch):
-    return bgr
-
 # 与近照同一曝光下（石灰约 200）的地面颜色，BGR
 GROUNDS = {
     '红土': (75, 105, 160),
@@ -116,7 +113,7 @@ def run_case(job):
     cam = Camera.default(*size)
     out = {}
     for ch in CHANNELS:
-        res, _ = detect_frame(to_channel(bgr, ch), cam, PARAMS, r_range=(0.7 * r_t, 1.4 * r_t))
+        res, _ = detect_frame(bgr, cam, PARAMS, r_range=(0.7 * r_t, 1.4 * r_t))
         hit, fp, why = False, 0, ''
         for c, m in res:
             if gt and math.hypot(c.x - gt[0], c.y - gt[1]) < 0.5 * r_t and not why:
@@ -157,7 +154,7 @@ def main():
         cx, cy, r = (float(v) for v in a.gt.split(','))
     else:
         H, W = bgr.shape[:2]
-        res, _ = detect_frame(to_channel(bgr, 'gray'), Camera.default(W, H), P, r_range=(20, min(W, H) / 2))
+        res, _ = detect_frame(bgr, Camera.default(W, H), P, r_range=(20, min(W, H) / 2))
         ok = sorted([m for _, m in res if m.ok], key=lambda m: (-m.sectors, -m.r))
         if not ok:
             sys.exit('近照上没检测到环，用 --gt cx,cy,r 手动给')
