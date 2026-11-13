@@ -40,7 +40,7 @@
 ## 安装
 
 ```bash
-sudo apt install cmake g++ libopencv-dev python3-opencv python3-numpy python3-yaml
+sudo apt install cmake g++ libopencv-dev python3-opencv python3-numpy python3-yaml python3-pytest
 cd ~/find_circle
 ./build.sh                 # 编译 ED_Lib -> ringdet/_lib/libedcircles.so
 python3 -m pytest -q tests/
@@ -59,15 +59,26 @@ Jetson Orin 已安装 JetPack CUDA 开发工具后，可一键配置项目专用
 
 ### 换一台 Nano
 
+需要 CUDA OpenCV 时直接跑一键脚本（推荐）：
+
 ```bash
 git clone https://github.com/xhy-yyy/find_circle.git   # 已配 SSH key 也可用 git@github.com:xhy-yyy/find_circle.git
 cd find_circle
-./run.sh setup                 # 系统 Python + 系统 OpenCV，先跑通 CPU 路径
-./setup_jetson.sh              # 需要 CUDA 时再执行（首次联网，本机编译）
+./setup_jetson.sh              # 装依赖、本机编译 CUDA OpenCV、建 .venv-cuda、编译 ED_Lib
+./setup_jetson.sh --check      # 期望 OpenCV 4.14.0、CUDA 设备数 1
 SHOW=1 ./run.sh camera --stats
 ```
 
-不要从旧机器拷贝 `.venv-cuda/`、`build/`、`ringdet/_lib/`：它们和本机架构、OpenCV 路径绑定，必须在本机重新生成。`run.sh` 在 Orin Nano 上会自动使用 `orin_nano_8gb.yaml` 和 1080p60；相机不是 `/dev/video0` 时加 `DEV=/dev/videoX`。
+只跑 CPU 时，先按上面的 `apt` 命令装 `libopencv-dev` 等依赖，再：
+
+```bash
+./run.sh setup
+SHOW=1 ./run.sh camera --stats
+```
+
+`setup_jetson.sh` 会从 `codeload.github.com` 下载 OpenCV 源码；网络受限时，先在别的机器下好 `opencv-4.14.0.tar.gz` 和 `opencv_contrib-4.14.0.tar.gz`，放到新 Nano 的 `~/.cache/find_circle/opencv-cuda-4.14.0/`，脚本会自动复用。
+
+不要从旧机器拷贝 `.venv-cuda/`、`build/`、`ringdet/_lib/`：它们和本机架构、OpenCV 路径绑定，必须在本机重新生成。`run.sh` 在 Orin Nano 上会自动使用 `orin_nano_8gb.yaml` 和 1080p60；相机不是 `/dev/video0` 时加 `DEV=/dev/videoX`。更新代码后，CUDA 环境用 `./setup_jetson.sh --offline` 重编 ED_Lib（不需要联网），纯 CPU 用 `./build.sh`。
 
 ## 测试图片和视频
 
@@ -95,9 +106,9 @@ v4l2-ctl -d /dev/video0 --list-formats-ext
 CALIB=cam.yaml UDP_OUT=地面站IP:9000 LISTEN=9001 ./run.sh camera
 ```
 
-默认保持摄像头原有曝光和对焦设置。曾设置手动曝光、需要恢复自动时，运行 `EXPOSURE=auto ./run.sh camera`。户外需要限制运动拖影时，可用 `EXPOSURE=20 ./run.sh camera` 显式设置 2 ms 手动曝光，并根据画面亮度调试。数字曝光值的单位是 100 µs；控件名称以 `v4l2-ctl -l` 为准。
+默认保持摄像头原有曝光和对焦设置。曾设置手动曝光、需要恢复自动时，运行 `EXPOSURE=auto ./run.sh camera`。户外需要限制运动拖影时，可用 `EXPOSURE=20 ./run.sh camera` 显式设置 2 ms 手动曝光，并根据画面亮度调试。数字曝光值的单位是 100 µs；控件名称以 `v4l2-ctl -l` 为准。相机只支持 YUYV 时加 `--camera-format YUYV`；硬件采集通路打不开时加 `--capture v4l2`。
 
-Jetson Orin Nano 更新代码后先运行 `./build.sh`，在板端编译 CPU 金字塔复用、射线评分、圆心精修和椭圆假设验证函数。Python OpenCV 与 C++ OpenCV 应使用同一套安装，不能复制电脑上的 `.so` 到板端。CUDA 需要 OpenCV 实际编译相应模块，仅安装 CUDA 驱动不会自动启用这些接口。
+Jetson Orin Nano 更新代码后：装 CUDA 环境的运行 `./setup_jetson.sh --offline`，纯 CPU 的运行 `./build.sh`，在板端编译 CPU 金字塔复用、射线评分、圆心精修和椭圆假设验证函数。Python OpenCV 与 C++ OpenCV 应使用同一套安装，不能复制电脑上的 `.so` 到板端。CUDA 需要 OpenCV 实际编译相应模块，仅安装 CUDA 驱动不会自动启用这些接口。
 
 `./run.sh` 在 Orin Nano 上默认加载 `orin_nano_8gb.yaml`，可用 `PARAMS` 指定其他配置。CPU 负责 FFT 搜索、几何复核、身份确认、在线学习和峰值筛选。CUDA 光流和大区域模板匹配分别检测可用性，各自保留 CPU 回退。Nano 点击附近的小环搜索每个 FFT 任务处理六个半径，完整搜索每次处理两个半径。积压候选优先复核，预算耗尽时仍允许一次原图复核。Nano 视频预览默认保存逐帧日志，指定 `--out out/标注.mp4` 时同时编码标注视频。相机预览默认 15 FPS。
 
@@ -111,13 +122,13 @@ SHOW=1 PARAMS=orin_nano_8gb.yaml ./run.sh camera --threads 4 --stats --quiet
 SHOW=1 PARAMS=orin_nano_8gb.yaml ./run.sh video ~/测试视频.mp4
 ```
 
-启动日志中的“运动估计”“重捕匹配”显示实际后端；“峰值筛选：cpu”为本配置的固定分工。若前两项显示 CPU，表示对应 CUDA 设备或模块不可用，配置不会强行启用不存在的 GPU 接口。SEARCH FFT 当前为 CPU 实现，此配置不启用 CUDA FFT。录像与曝光沿用原设置；首次只测处理性能时，可在命令前加 `REC_DIR=""`。
+启动日志中的“运动估计”“重捕匹配”显示实际后端；“峰值筛选：cpu”为本配置的固定分工。若前两项显示 CPU，表示对应 CUDA 设备或模块不可用，配置不会强行启用不存在的 GPU 接口。SEARCH FFT 当前为 CPU 实现，此配置不启用 CUDA FFT。默认不录像；需要录像时在命令前加 `REC_DIR=~/find_circle_rec`，曝光沿用原设置。
 
 ```bash
 SHOW=1 ./run.sh camera --threads 4 --set motion.backend=auto --stats --quiet
 ./run.sh camera --set motion.backend=cuda       # 要求 CUDA；不可用时明确报错
 ./run.sh camera --set motion.backend=cpu        # 只用 CPU
-REC_DIR="" ./run.sh camera                      # 关闭录像和文件日志
+REC_DIR=~/find_circle_rec ./run.sh camera       # 开启录像和文件日志
 ```
 
 香橙派使用相同代码，在板端重新编译后运行 `SHOW=1 ./run.sh camera --threads 4 --set motion.backend=cpu --set track.template_backend=cpu --stats --quiet`。RK3588 的 GPU 不使用 CUDA，当前走 CPU 加速路径。两块板都保留摄像头原有曝光设置；对比性能时保持分辨率、录像、预览配置一致，可分别比较 `--threads 2` 和 `--threads 4`。
@@ -128,7 +139,7 @@ REC_DIR="" ./run.sh camera                      # 关闭录像和文件日志
 
 GPU 匹配缓存最多 32 个模板，缓存图像数据不超过 16 MiB，并复用响应缓冲区。启动预热时按小、中、大响应区域比较“GPU 峰值筛选”和“下载响应图后 CPU 筛选”的完整耗时，仅启用结果一致且实测更快的路径。GPU 筛选只返回前两个峰、均值和标准差；同分峰、低方差、PSR 临界值或接口不支持时沿用原响应图筛选。启动日志显示各区域的分配；`--set track.compact_gpu_matching=false` 可关闭 GPU 峰值筛选，保留 GPU 匹配和缓存。EDCircles、在线滤波、身份确认与状态机继续使用 CPU。
 
-相机录像使用有界后台队列，不阻塞识别；安装 `ffmpeg` 且相机后端支持原始 MJPEG 时直接保存压缩码流，否则后台编码。`--record-mode encode` 可固定使用编码路径，结束时显示写入与丢弃帧数。预览默认 15 FPS，识别仍逐帧处理；可用 `--display-fps 30` 提高预览刷新率。启动会预热常用滤波核和 CUDA 接口。
+开启录像时使用有界后台队列，不阻塞识别；安装 `ffmpeg` 且相机后端支持原始 MJPEG 时直接保存压缩码流，否则后台编码。`--record-mode encode` 可固定使用编码路径，结束时显示写入与丢弃帧数。预览默认 15 FPS，识别仍逐帧处理；可用 `--display-fps 30` 提高预览刷新率。启动会预热常用滤波核和 CUDA 接口。
 
 `--stats` 每秒报告实际处理的新帧 FPS、漏处理帧数、算法 P95 和帧龄；它们与录像文件头的 FPS 不同。输入为 30 FPS 时，新帧输出上限为 30 FPS；要实测超过 30 FPS，先确认摄像头支持并实际输出更高帧率。检查性能时应开启与实用场景相同的录像、预览配置。
 

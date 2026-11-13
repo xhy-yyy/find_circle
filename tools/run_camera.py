@@ -279,7 +279,10 @@ def main():
     in_sock = None
     if a.listen:
         in_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        in_sock.bind(('0.0.0.0', a.listen))
+        try:
+            in_sock.bind(('0.0.0.0', a.listen))
+        except OSError as e:
+            sys.exit(f'监听端口 {a.listen} 失败：{e}（可能已有实例在运行，可用 --listen 换端口）')
         in_sock.setblocking(False)
 
     trk.warmup()
@@ -334,7 +337,10 @@ def main():
     disp_scale = min(1.0, 1280 / rw)
     clicks = []
     if a.show:
-        cv2.namedWindow('ringdet')
+        try:
+            cv2.namedWindow('ringdet')
+        except cv2.error as e:
+            sys.exit(f'无法创建预览窗口（没有显示器？）：{e}\n去掉 --show，或用 UDP_OUT / --log 输出结果')
         cv2.setMouseCallback('ringdet', lambda ev, x, y, *_: clicks.append((x / disp_scale, y / disp_scale))
                              if ev == cv2.EVENT_LBUTTONDOWN else None)
 

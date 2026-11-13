@@ -37,7 +37,10 @@ die() { echo "错误：$*" >&2; exit 1; }
 need_lib() {
   [[ -f ringdet/_lib/libedcircles.so ]] && return
   echo "还没编译 ED_Lib，先编译……"
-  ./build.sh >/dev/null
+  if ! ./build.sh; then
+    echo 'ED_Lib 编译失败。若只安装了项目专用 CUDA OpenCV，请重新运行 ./setup_jetson.sh（或 --offline）。' >&2
+    exit 1
+  fi
 }
 
 has_arg() {   # has_arg --out "$@"：参数里有没有某个选项

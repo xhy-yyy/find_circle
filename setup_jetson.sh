@@ -37,7 +37,8 @@ while (($#)); do
 done
 [[ "$jobs" =~ ^[1-9][0-9]*$ ]] || die '--jobs 必须为正整数'
 case "$power" in keep|25w|max) ;; *) die '--power 只能是 keep、25w 或 max' ;; esac
-[[ "$(uname -m)" == aarch64 && -r /etc/nv_tegra_release ]] || die '此脚本需要在 Jetson Orin 上运行'
+[[ "$(uname -m)" == aarch64 ]] && { [[ -r /etc/nv_tegra_release ]] || [[ -r /etc/nv_boot_control.conf ]]; } \
+  || die '此脚本需要在 Jetson Orin 上运行'
 model="$(tr -d '\0' </proc/device-tree/model)"
 [[ "$model" == *Orin* ]] || die "此脚本面向 Jetson Orin，当前设备：$model"
 ((EUID != 0)) || die '请以普通用户运行，脚本会按需调用 sudo'
@@ -78,6 +79,9 @@ if ((check)); then
   exit 0
 fi
 
+avail_gb=$(( $(df -Pk "$HOME" | awk 'NR==2 {print $4}') / 1024 / 1024 ))
+(( avail_gb >= 15 )) || echo "警告：$HOME 剩余约 ${avail_gb} GB，编译 OpenCV CUDA 建议至少 15 GB" >&2
+
 if ((offline == 0)); then
 sudo -v
 sudo env DEBIAN_FRONTEND=noninteractive apt-get update
@@ -86,7 +90,7 @@ sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommen
   python3-dev python3-venv python3-numpy python3-yaml python3-pytest \
   libgtk-3-dev libavcodec-dev libavformat-dev libswscale-dev \
   libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-  libtbb-dev libjpeg-dev libpng-dev ffmpeg v4l-utils
+  libtbb-dev libjpeg-dev libpng-dev ffmpeg v4l-utils psmisc
 fi
 mkdir -p "$cache"
 ((offline)) || mkdir -p "$prefix"
@@ -137,9 +141,12 @@ PY
     archive="$cache/$name-$version.tar.gz"
     if [[ ! -d "$src" ]]; then
       if [[ ! -f "$archive" ]]; then
-        curl -fL --retry 3 --connect-timeout 15 \
-          "https://codeload.github.com/opencv/$name/tar.gz/refs/tags/$version" \
-          -o "$archive.part"
+        url="https://codeload.github.com/opencv/$name/tar.gz/refs/tags/$version"
+        if ! curl -fL --retry 3 --connect-timeout 15 "$url" -o "$archive.part"; then
+          rm -f "$archive.part"
+          die "下载失败：$url
+可手动下载后放到 $archive（文件名保持一致）"
+        fi
         mv "$archive.part" "$archive"
       fi
       tar -xzf "$archive" -C "$cache"
@@ -218,4 +225,5 @@ PY
 fi
 /usr/sbin/nvpmodel -q
 echo '配置完成。run.sh 将自动使用 .venv-cuda，系统 Python 的 OpenCV 保留。'
-echo '摄像头运行：PARAMS=orin_nano_8gb.yaml SHOW=1 ./run.sh camera --stats --quiet'
+echo '有显示器：SHOW=1 ./run.sh camera --stats --quiet'
+echo '无显示器：UDP_OUT=<地面站IP>:9000 ./run.sh camera --stats --quiet'
