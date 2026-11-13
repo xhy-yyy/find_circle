@@ -57,6 +57,18 @@ Jetson Orin 已安装 JetPack CUDA 开发工具后，可一键配置项目专用
 
 脚本会安装依赖、编译或复用 CUDA OpenCV、建立 `.venv-cuda`、编译项目并验证 GPU；`run.sh` 自动使用该环境，系统 OpenCV 保留。默认保持功耗模式；`--power max` 只切换已经开放的官方 MAXN_SUPER 档，不更新启动固件、不自动重启。仅 CPU 运行仍可使用系统 OpenCV 和 `./build.sh`。
 
+### 换一台 Nano
+
+```bash
+git clone https://github.com/xhy-yyy/find_circle.git   # 已配 SSH key 也可用 git@github.com:xhy-yyy/find_circle.git
+cd find_circle
+./run.sh setup                 # 系统 Python + 系统 OpenCV，先跑通 CPU 路径
+./setup_jetson.sh              # 需要 CUDA 时再执行（首次联网，本机编译）
+SHOW=1 ./run.sh camera --stats
+```
+
+不要从旧机器拷贝 `.venv-cuda/`、`build/`、`ringdet/_lib/`：它们和本机架构、OpenCV 路径绑定，必须在本机重新生成。`run.sh` 在 Orin Nano 上会自动使用 `orin_nano_8gb.yaml` 和 1080p60；相机不是 `/dev/video0` 时加 `DEV=/dev/videoX`。
+
 ## 测试图片和视频
 
 ```bash
